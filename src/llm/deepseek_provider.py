@@ -7,8 +7,6 @@ class DeepSeekProvider:
         self.config = config
 
     def generate_tests(self, prompt: str) -> str:
-        # Many DeepSeek setups are OpenAI-compatible; use openai SDK with base_url
-        # Requires: openai package installed and base_url set if needed.
         from openai import OpenAI
 
         client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)

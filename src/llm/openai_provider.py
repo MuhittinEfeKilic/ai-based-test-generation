@@ -7,7 +7,6 @@ class OpenAIProvider:
         self.config = config
 
     def generate_tests(self, prompt: str) -> str:
-        # Requires: openai package installed
         from openai import OpenAI
 
         client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)

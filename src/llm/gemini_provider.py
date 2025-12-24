@@ -7,7 +7,6 @@ class GeminiProvider:
         self.config = config
 
     def generate_tests(self, prompt: str) -> str:
-        # Requires: google-generativeai package installed
         import google.generativeai as genai
 
         genai.configure(api_key=self.config.api_key)

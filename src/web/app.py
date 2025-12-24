@@ -4,9 +4,9 @@ import shutil
 from pathlib import Path
 import streamlit as st
 
-# ---- PATH FIX ----
-SRC_DIR = Path(__file__).resolve().parents[1]      # .../src
-PROJECT_ROOT = SRC_DIR.parent                      # .../project_root
+#  PATHS
+SRC_DIR = Path(__file__).resolve().parents[1]      # ./src
+PROJECT_ROOT = SRC_DIR.parent                      # ./project_root
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -18,7 +18,7 @@ from cov_tools.coverage_analyzer import CoverageAnalyzer
 # LLM layer
 from llm import LLMConfig, generate_with_optional_llm
 
-# Optional: syntax-highlight editor with line numbers
+#Editor with line numbers
 try:
     from streamlit_ace import st_ace
     ACE_AVAILABLE = True
@@ -31,7 +31,8 @@ def clean_artifacts(project_root: Path) -> dict:
     sample_dir = data_dir / "sample_code"
     uploads_dir = data_dir / "uploads"
     coverage_dir = data_dir / "coverage_html"
-    generated_tests_dir = data_dir / "generated_tests"
+    generated_tests_dir = project_root / "tests" / "generated"
+    legacy_generated_dir = data_dir / "generated_tests"
 
     deleted = {
         "tmp_targets": 0,
@@ -41,7 +42,7 @@ def clean_artifacts(project_root: Path) -> dict:
         "errors": [],
     }
 
-    # 1) tmp_target_*.py
+    #tmp_target_#.py creation
     try:
         if sample_dir.exists():
             for p in sample_dir.glob("tmp_target_*.py"):
@@ -50,7 +51,7 @@ def clean_artifacts(project_root: Path) -> dict:
     except Exception as e:
         deleted["errors"].append(f"tmp_targets: {e}")
 
-    # 2) uploads/*
+    #2)uploads/
     try:
         if uploads_dir.exists():
             for p in uploads_dir.glob("*"):
@@ -62,7 +63,7 @@ def clean_artifacts(project_root: Path) -> dict:
     except Exception as e:
         deleted["errors"].append(f"uploads: {e}")
 
-    # 3) coverage_html/*
+    # 3)coverage_html/
     try:
         if coverage_dir.exists():
             shutil.rmtree(coverage_dir, ignore_errors=True)
@@ -70,11 +71,15 @@ def clean_artifacts(project_root: Path) -> dict:
     except Exception as e:
         deleted["errors"].append(f"coverage_html: {e}")
 
-    # 4) optional: generated test file
+    # 4)generated test file
     try:
         gen_file = generated_tests_dir / "test_generated_from_ui.py"
+        legacy_file = legacy_generated_dir / "test_generated_from_ui.py"
         if gen_file.exists():
             gen_file.unlink(missing_ok=True)
+            deleted["generated_test_file"] = True
+        if legacy_file.exists():
+            legacy_file.unlink(missing_ok=True)
             deleted["generated_test_file"] = True
     except Exception as e:
         deleted["errors"].append(f"generated_test_file: {e}")
@@ -94,7 +99,7 @@ def sidebar_api_key(use_llm: bool, label: str, secret_name: str) -> str | None:
     """
     secret_val = st.secrets.get(secret_name, None)
     if secret_val:
-        st.sidebar.success(f"{label}: loaded from secrets ✅")
+        st.sidebar.success(f"{label}: loaded from secrets")
         return secret_val
 
     return st.sidebar.text_input(
@@ -111,14 +116,14 @@ st.caption("Paste/Upload Python code → Analyze → Generate pytest → Run cov
 
 data_dir = PROJECT_ROOT / "data"
 sample_dir = data_dir / "sample_code"
-generated_dir = data_dir / "generated_tests"
+generated_dir = PROJECT_ROOT / "tests" / "generated"
 coverage_html = data_dir / "coverage_html" / "index.html"
 uploads_dir = data_dir / "uploads"
 
 sample_dir.mkdir(parents=True, exist_ok=True)
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
-# ---------------- Sidebar ----------------
+#Sidebar
 st.sidebar.header("Input")
 
 mode = st.sidebar.radio(
@@ -130,16 +135,16 @@ uploaded = None
 if mode == "Upload a .py file":
     uploaded = st.sidebar.file_uploader("Upload Python file", type=["py"])
 
-# --- Generation Settings (LLM optional) ---
+#Generation Settings (LLM optional)
 st.sidebar.divider()
 st.sidebar.header("Generation Settings")
 
 use_llm = st.sidebar.checkbox("Use LLM (optional)", value=False)
 
-# Providers requested
+#Providers requested
 PROVIDERS = ["mock", "gemini", "openai", "claude", "deepseek"]
 
-# Provider label above dropdown (as requested)
+#Provider label above dropdown
 st.sidebar.markdown("**LLM Provider**")
 provider = st.sidebar.selectbox(
     label="LLM Provider (hidden)",
@@ -149,7 +154,7 @@ provider = st.sidebar.selectbox(
     label_visibility="collapsed",
 )
 
-# Creativity (temperature)
+#Creativity (Complexity)
 temp_label = st.sidebar.radio(
     "Creativity",
     options=["Low", "Medium", "High"],
@@ -159,7 +164,7 @@ temp_label = st.sidebar.radio(
 )
 temperature = get_temperature(temp_label)
 
-# Auto model selection (no user model selection)
+#Auto model selection (if no user model selection)
 DEFAULT_MODELS = {
     "mock": "mock",
     "openai": "gpt-4o-mini",
@@ -169,7 +174,7 @@ DEFAULT_MODELS = {
 }
 model_name = DEFAULT_MODELS.get(provider, "mock")
 
-# Provider-specific settings (keys + optional base_url)
+# Provider-specific settings
 api_key = None
 base_url = None
 
@@ -191,7 +196,7 @@ elif provider == "deepseek":
 
 st.sidebar.caption("If LLM fails, the system automatically falls back to rule-based generation.")
 
-# --- Run / Clean ---
+# Run/Clean
 st.sidebar.divider()
 run_btn = st.sidebar.button("Run Analysis → Generate Tests → Coverage", type="primary")
 
@@ -210,7 +215,7 @@ if st.sidebar.button("🧹 Clean temp files & reports"):
             f"generated_test_file={result['generated_test_file']}"
         )
 
-# ---------------- Main layout ----------------
+#Main layout
 col1, col2 = st.columns(2)
 
 pasted_code = ""
@@ -232,7 +237,7 @@ with col1:
                 font_size=14,
                 tab_size=4,
                 wrap=True,
-                show_gutter=True,       # line numbers
+                show_gutter=True,
                 show_print_margin=False,
                 auto_update=True,
             )
@@ -251,7 +256,7 @@ with col1:
         else:
             target_path = None
 
-    else:  # Upload mode
+    else:  #Upload mode
         if uploaded is not None:
             target_path = uploads_dir / uploaded.name
             target_path.write_bytes(uploaded.getvalue())
@@ -274,7 +279,6 @@ with col2:
             st.stop()
 
         try:
-            # 0) Always create a unique tmp module for safe import & coverage
             unique_stem = f"tmp_target_{int(time.time())}"
             tmp_target = sample_dir / f"{unique_stem}.py"
             tmp_target.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -282,25 +286,25 @@ with col2:
 
             st.info(f"Target module: {module_import}")
 
-            # 1) Analysis
+            #1)Analysis
             analyzer = CodeAnalyzer()
             analysis = analyzer.analyze_as_dict(str(target_path))
             st.markdown("### 1) Analysis Output")
             st.json(analysis)
 
-            # 2) Test plan
+            #2)Test plan
             test_plan = build_test_plan(analysis)
             st.markdown("### 2) Test Plan")
             st.json(test_plan)
 
-            # 3) Prompt
+            #3)Prompt
             prompt = build_llm_prompt(test_plan)
             prompt = f"TARGET_MODULE_IMPORT={module_import}\n" + prompt
 
             st.markdown("### 3) LLM Prompt")
             st.code(prompt)
 
-            # 4) Generate pytest code (LLM optional + fallback)
+            #4)Generate pytest code
             llm_cfg = LLMConfig(
                 provider=provider if use_llm else "mock",
                 api_key=api_key,
@@ -312,12 +316,14 @@ with col2:
 
             generated_source = "rule-based"
             llm_error = None
+            coverage_code = None
 
             if use_llm:
                 llm_result = generate_with_optional_llm(prompt, llm_cfg)
                 if llm_result.source == "llm" and llm_result.code.strip():
                     pytest_code = llm_result.code
                     generated_source = "llm"
+                    coverage_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
                 else:
                     llm_error = llm_result.error
                     pytest_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
@@ -325,28 +331,32 @@ with col2:
             else:
                 pytest_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
                 generated_source = "rule-based"
+            if coverage_code is None:
+                coverage_code = pytest_code
 
             st.markdown("### 4) Generated Pytest Code")
             st.info(f"Generation Source: {generated_source}")
             if llm_error:
                 st.warning(f"LLM not used: {llm_error}")
+            if generated_source == "llm":
+                st.info("Coverage will use safe rule-based tests to avoid brittle inputs.")
 
             st.code(pytest_code, language="python")
 
-            # 5) Save tests
+            #5)Save tests
             generated_dir.mkdir(parents=True, exist_ok=True)
             out_file = generated_dir / "test_generated_from_ui.py"
-            saved_path = save_tests(pytest_code, out_file)
+            saved_path = save_tests(coverage_code, out_file)
             st.success(f"Saved test file: {saved_path}")
 
             st.download_button(
                 label="Download generated test file",
-                data=pytest_code,
+                data=coverage_code,
                 file_name="test_generated_from_ui.py",
                 mime="text/x-python",
             )
 
-            # 6) Coverage
+            #6)Coverage
             st.markdown("### 5) Coverage")
             cov = CoverageAnalyzer()
             cov.run_coverage(
@@ -357,11 +367,11 @@ with col2:
             )
 
             if coverage_html.exists():
-                st.success("Coverage completed ✅")
+                st.success("Coverage completed")
                 st.info(f"HTML report path: {coverage_html}")
             else:
                 st.warning("Coverage completed, but HTML report file was not found.")
 
         except Exception as e:
-            st.error("Run failed ❌")
+            st.error("Run failed")
             st.exception(e)

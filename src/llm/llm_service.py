@@ -55,7 +55,6 @@ def _get_provider(cfg: LLMConfig):
 
 
 def generate_with_optional_llm(prompt: str, cfg: LLMConfig) -> LLMResult:
-    # Missing key for providers that require it => fallback
     if cfg.provider in {"openai", "gemini", "claude", "deepseek"} and not cfg.api_key:
         return LLMResult(source="fallback", code="", error=f"Missing API key for provider: {cfg.provider}")
 

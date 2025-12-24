@@ -9,8 +9,8 @@ class CodeAnalyzer:
         self._parser = ASTParser()
 
     def analyze(self, file_path: str) -> List[FunctionInfo]:
-        tree = self._parser.parse_file(file_path)
-        return self._parser.extract_functions(tree)
+        tree, source = self._parser.parse_file(file_path)
+        return self._parser.extract_functions(tree, source)
 
     def analyze_as_dict(self, file_path: str) -> List[Dict]:
         infos = self.analyze(file_path)

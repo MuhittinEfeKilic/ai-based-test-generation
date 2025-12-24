@@ -12,11 +12,11 @@ def build_test_plan(analysis: List[Dict]) -> Dict:
     for fn in analysis:
         scenarios = []
 
-        # Temel senaryolar
+        #Temel
         scenarios.append("valid typical inputs")
         scenarios.append("edge cases (zero/empty/None if applicable)")
 
-        # Kontrol yapısına göre
+        #Kontrol
         if fn.get("has_if"):
             scenarios.append("branches for conditional paths (true/false)")
 
@@ -26,7 +26,7 @@ def build_test_plan(analysis: List[Dict]) -> Dict:
         if fn.get("has_print"):
             scenarios.append("prints output (capture with capsys)")
 
-        # Return sayısına göre
+        #Return sayısına göre
         if fn.get("returns_count", 0) >= 2:
             scenarios.append("multiple return paths should be covered")
 
@@ -34,12 +34,17 @@ def build_test_plan(analysis: List[Dict]) -> Dict:
             {
                  "name": fn["name"],
                 "args": fn["args"],
-                # flags needed by generator:
+                "annotations": fn.get("annotations", {}),
+                #flags needed by generator
                 "has_if": fn.get("has_if", False),
                 "has_for": fn.get("has_for", False),
                 "has_while": fn.get("has_while", False),
                 "returns_count": fn.get("returns_count", 0),
                 "has_print": fn.get("has_print", False),
+                "print_strings": fn.get("print_strings", []),
+                "has_negative_check": fn.get("has_negative_check", False),
+                "raises_value_error": fn.get("raises_value_error", False),
+                "source": fn.get("source", ""),
                 "recommended_scenarios": scenarios,
             }
         )
@@ -49,8 +54,7 @@ def build_test_plan(analysis: List[Dict]) -> Dict:
 
 def build_llm_prompt(test_plan: Dict) -> str:
     """
-    Week 4'te LLM entegrasyonunda kullanacağız.
-    Şimdilik prompt metnini standart bir formatta üretelim.
+    Week 4'te LLM entegrasyonunda kullanacağız. Şimdilik prompt metnini standart bir formatta üretelim.
     """
     lines = []
     lines.append("You are an assistant that writes pytest unit tests.")
