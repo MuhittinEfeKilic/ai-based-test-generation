@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .provider import LLMConfig
+from .provider import DEFAULT_BASE_URLS, REMOTE_PROVIDERS, LLMConfig
 from .mock_provider import MockLLMProvider
 
 
@@ -39,6 +39,12 @@ def _get_provider(cfg: LLMConfig):
         from .openai_provider import OpenAIProvider
         return OpenAIProvider(cfg)
 
+    if cfg.provider == "deepseek":
+        # DeepSeek is OpenAI-compatible; it only needs its own endpoint.
+        from .openai_provider import OpenAIProvider
+        base_url = cfg.base_url or DEFAULT_BASE_URLS["deepseek"]
+        return OpenAIProvider(replace(cfg, base_url=base_url))
+
     if cfg.provider == "gemini":
         from .gemini_provider import GeminiProvider
         return GeminiProvider(cfg)
@@ -47,15 +53,17 @@ def _get_provider(cfg: LLMConfig):
         from .claude_provider import ClaudeProvider
         return ClaudeProvider(cfg)
 
-    if cfg.provider == "deepseek":
-        from .deepseek_provider import DeepSeekProvider
-        return DeepSeekProvider(cfg)
-
     return MockLLMProvider()
 
 
 def generate_with_optional_llm(prompt: str, cfg: LLMConfig) -> LLMResult:
-    if cfg.provider in {"openai", "gemini", "claude", "deepseek"} and not cfg.api_key:
+    """Ask the configured provider for tests, falling back on any problem.
+
+    Every failure mode - missing key, network error, non-code answer, code that
+    does not parse - returns ``source="fallback"`` with an ``error`` message so
+    the caller can degrade to the rule-based generator instead of crashing.
+    """
+    if cfg.provider in REMOTE_PROVIDERS and not cfg.api_key:
         return LLMResult(source="fallback", code="", error=f"Missing API key for provider: {cfg.provider}")
 
     try:

@@ -157,8 +157,17 @@ def _normalize_annotation(param_annotation):
     return "unknown"
 
 
-def build_safe_arg_value(param_name: str, param_annotation, inferred_keys: set[str]):
+def build_safe_arg_value(param_name: str, param_annotation, inferred_keys: set[str], usage_kind: str | None = None):
     kind = _normalize_annotation(param_annotation)
+    if kind == "unknown" and usage_kind:
+        if usage_kind == "numeric":
+            return 1
+        if usage_kind == "list_dict":
+            return [_build_dict_from_keys(inferred_keys)]
+        if usage_kind == "dict":
+            return _build_dict_from_keys(inferred_keys)
+        if usage_kind == "list":
+            return []
     if kind == "list_dict":
         return [_build_dict_from_keys(inferred_keys)]
     if kind == "dict":
@@ -185,8 +194,87 @@ def build_safe_arg_value(param_name: str, param_annotation, inferred_keys: set[s
     return 0
 
 
-def _build_arg_candidates(param_name: str, param_annotation, inferred_keys: set[str]) -> List:
+ARITHMETIC_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv)
+
+
+def _infer_usage_kinds(function_source: str, param_names: List[str], inferred_keys: set[str]) -> Dict[str, str]:
+    """Guess a parameter's type from how the body uses it.
+
+    Unannotated code is the common case for pasted snippets, and the name-based
+    fallback alone happily feeds `''` or `None` to a function that immediately
+    compares its argument to a number. Reading the body is far more reliable.
+    """
+    kinds: Dict[str, str] = {}
+    if not function_source or not param_names:
+        return kinds
+    try:
+        tree = ast.parse(function_source)
+    except SyntaxError:
+        return kinds
+
+    names = set(param_names)
+    numeric: set[str] = set()
+    iterated: set[str] = set()
+    str_subscripted: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.iter, ast.Name):
+            if node.iter.id in names:
+                iterated.add(node.iter.id)
+
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            if node.value.id in names:
+                key = node.slice
+                if isinstance(key, ast.Index):  # Python < 3.9 shape
+                    key = key.value
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    str_subscripted.add(node.value.id)
+
+        elif isinstance(node, ast.Compare):
+            sides = [node.left, *node.comparators]
+            has_number = any(
+                isinstance(s, ast.Constant) and isinstance(s.value, (int, float))
+                and not isinstance(s.value, bool)
+                for s in sides
+            )
+            if has_number:
+                for side in sides:
+                    if isinstance(side, ast.Name) and side.id in names:
+                        numeric.add(side.id)
+
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ARITHMETIC_OPS):
+            for side in (node.left, node.right):
+                if isinstance(side, ast.Name) and side.id in names:
+                    numeric.add(side.id)
+
+    for name in names:
+        if name in iterated:
+            kinds[name] = "list_dict" if inferred_keys else "list"
+        elif name in str_subscripted:
+            kinds[name] = "dict"
+        elif name in numeric:
+            kinds[name] = "numeric"
+
+    return kinds
+
+
+def _build_arg_candidates(
+    param_name: str,
+    param_annotation,
+    inferred_keys: set[str],
+    usage_kind: str | None = None,
+) -> List:
     kind = _normalize_annotation(param_annotation)
+    if kind == "unknown" and usage_kind:
+        if usage_kind == "numeric":
+            return [1, 0, -1]
+        if usage_kind == "list_dict":
+            base = _build_dict_from_keys(inferred_keys)
+            return [[base], [base, base]]
+        if usage_kind == "dict":
+            return [_build_dict_from_keys(inferred_keys)]
+        if usage_kind == "list":
+            return [[], [1]]
     if kind == "optional_str":
         return ["SAVE10", "INVALID", None]
     if kind == "int":
@@ -216,10 +304,12 @@ def _format_arg_value(value) -> str:
     return repr(value)
 
 
-def _is_numeric_param(param_name: str, param_annotation) -> bool:
+def _is_numeric_param(param_name: str, param_annotation, usage_kind: str | None = None) -> bool:
     kind = _normalize_annotation(param_annotation)
     if kind in {"int", "float"}:
         return True
+    if kind == "unknown" and usage_kind:
+        return usage_kind == "numeric"
     guessed = _guess_kind(param_name)
     return guessed in {"age", "int", "float_divisor"}
 
@@ -286,7 +376,7 @@ def _build_print_call_args(
 ):
     overrides = {}
     targets = _infer_print_param_targets(function_source, args)
-    for idx, a in enumerate(args):
+    for a in args:
         kind = _normalize_annotation(annotations.get(a))
         if a in targets:
             if kind in {"list", "list_dict"}:
@@ -310,26 +400,45 @@ def _build_print_call_args(
     return ", ".join(values)
 
 
+def _call_expr(fn_name: str, arg_str: str, is_async: bool) -> str:
+    call = f"{fn_name}({arg_str})"
+    return f"asyncio.run({call})" if is_async else call
+
+
 def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
+    """Emit rule-based pytest source for every function in the plan.
+
+    Note: this imports ``module_import`` so it can read runtime type hints,
+    which executes the target module's top-level code. Only run it on code you
+    trust. Import failures are swallowed and degrade the result to
+    annotation-string inference.
+    """
     lines: List[str] = []
+    functions = test_plan["functions"]
+    needs_asyncio = any(fn.get("is_async") for fn in functions)
 
     # --- imports & path fix ---
     lines.append("import os")
     lines.append("import sys")
+    if needs_asyncio:
+        lines.append("import asyncio")
     lines.append("from pathlib import Path")
+    lines.append("")
+    lines.append("import pytest")
     lines.append("")
     lines.append("PROJECT_ROOT = Path(__file__).resolve().parents[2]")
     lines.append("if str(PROJECT_ROOT) not in sys.path:")
     lines.append("    sys.path.insert(0, str(PROJECT_ROOT))")
     lines.append("")
-    lines.append(
-        f"from {module_import} import " + ", ".join(fn["name"] for fn in test_plan["functions"])
-    )
-    lines.append("")
-    lines.append("import pytest")
-    lines.append("")
+    # The skip must precede the target import: the generated file lives in the
+    # repo but its target is a scratch module, so importing first would turn a
+    # deliberately disabled test run into a collection error.
     lines.append("if os.getenv('RUN_UI_GENERATED') != '1':")
     lines.append("    pytest.skip('ui generated tests are disabled', allow_module_level=True)")
+    lines.append("")
+    lines.append(
+        f"from {module_import} import " + ", ".join(fn["name"] for fn in functions)
+    )
     lines.append("")
 
     module_obj = None
@@ -338,12 +447,13 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
     except Exception:
         module_obj = None
 
-    for fn in test_plan["functions"]:
+    for fn in functions:
         fn_name = fn["name"]
         args = fn["args"]
         safe_fn = _sanitize_name(fn_name)
+        is_async = bool(fn.get("is_async", False))
 
-        #Sample arg literals
+        # Sample arg literals
         annotations = fn.get("annotations", {})
         fn_source = fn.get("source", "")
         inferred_keys = infer_dict_keys_from_ast(fn_source)
@@ -360,17 +470,18 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
         raises_value_error = bool(fn.get("raises_value_error", False))
 
         arg_candidates = []
-        param_flags = _infer_param_guards(fn.get("source", ""), args)
+        param_flags = _infer_param_guards(fn_source, args)
+        usage_kinds = _infer_usage_kinds(fn_source, args, inferred_keys)
         for a in args:
             hint = type_hints.get(a, annotations.get(a))
-            candidates = _build_arg_candidates(a, hint, inferred_keys)
+            candidates = _build_arg_candidates(a, hint, inferred_keys, usage_kinds.get(a))
             flags = param_flags.get(a, {})
             if flags.get("divisor") and not flags.get("zero_checked"):
                 candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c == 0)]
             if has_negative_check or raises_value_error or flags.get("negative_checked"):
                 candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c < 0)]
             if not candidates:
-                candidates = [build_safe_arg_value(a, hint, inferred_keys)]
+                candidates = [build_safe_arg_value(a, hint, inferred_keys, usage_kinds.get(a))]
             arg_candidates.append(candidates)
 
         typical_call = ", ".join(_format_arg_value(vals[0]) for vals in arg_candidates) if args else ""
@@ -392,9 +503,9 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
                     fn_source,
                     print_strings,
                 )
-                lines.append(f"    {fn_name}({print_call})")
             else:
-                lines.append(f"    {fn_name}()")
+                print_call = ""
+            lines.append(f"    {_call_expr(fn_name, print_call, is_async)}")
             lines.append("    captured = capsys.readouterr()")
             if print_strings:
                 lines.append(f"    assert {print_strings[0]!r} in captured.out")
@@ -404,34 +515,28 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
 
         if returns_count == 0:
             lines.append(f"def test_{safe_fn}_runs_without_exception():")
-            if args:
-                lines.append(f"    {fn_name}({typical_call})")
-            else:
-                lines.append(f"    {fn_name}()")
+            lines.append(f"    {_call_expr(fn_name, typical_call, is_async)}")
             lines.append("    assert True")
             lines.append("")
 
         else:
             lines.append(f"def test_{safe_fn}_typical_returns_value():")
-            call = f"{fn_name}({typical_call})" if args else f"{fn_name}()"
-            lines.append(f"    result = {call}")
+            lines.append(f"    result = {_call_expr(fn_name, typical_call, is_async)}")
             lines.append("    assert result is not None")
             lines.append("")
 
             lines.append(f"def test_{safe_fn}_edge_case_returns_value():")
-            call2 = f"{fn_name}({alt_call_1})" if args else f"{fn_name}()"
-            lines.append(f"    result = {call2}")
+            lines.append(f"    result = {_call_expr(fn_name, alt_call_1, is_async)}")
             lines.append("    assert result is not None")
             lines.append("")
 
             if fn.get("has_for") or fn.get("has_while") or fn.get("has_if") or returns_count >= 2:
                 lines.append(f"def test_{safe_fn}_additional_case_returns_value():")
-                call3 = f"{fn_name}({alt_call_2})" if args else f"{fn_name}()"
-                lines.append(f"    result = {call3}")
+                lines.append(f"    result = {_call_expr(fn_name, alt_call_2, is_async)}")
                 lines.append("    assert result is not None")
                 lines.append("")
 
-        if raises_value_error or (negative_dict_keys and raises_value_error):
+        if raises_value_error:
             neg_arg_index = None
             numeric_negative_checked = False
             for idx, a in enumerate(args):
@@ -441,17 +546,19 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
                     neg_arg_index = idx
                     numeric_negative_checked = True
                     break
-                if _is_numeric_param(a, hint):
+                if _is_numeric_param(a, hint, usage_kinds.get(a)):
                     neg_arg_index = idx
                     break
+
             dict_neg_index = None
-            if negative_dict_keys and raises_value_error:
+            if negative_dict_keys:
                 for idx, a in enumerate(args):
                     hint = type_hints.get(a, annotations.get(a))
                     kind = _normalize_annotation(hint)
                     if kind in {"list_dict", "dict"}:
                         dict_neg_index = idx
                         break
+
             if dict_neg_index is not None and not numeric_negative_checked:
                 hint = type_hints.get(args[dict_neg_index], annotations.get(args[dict_neg_index]))
                 kind = _normalize_annotation(hint)
@@ -469,7 +576,7 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
                 neg_call = ", ".join(neg_args)
                 lines.append(f"def test_{safe_fn}_negative_raises_value_error():")
                 lines.append("    with pytest.raises(ValueError):")
-                lines.append(f"        {fn_name}({neg_call})")
+                lines.append(f"        {_call_expr(fn_name, neg_call, is_async)}")
                 lines.append("")
             elif neg_arg_index is not None:
                 neg_args = []
@@ -484,7 +591,7 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
                 neg_call = ", ".join(neg_args)
                 lines.append(f"def test_{safe_fn}_negative_raises_value_error():")
                 lines.append("    with pytest.raises(ValueError):")
-                lines.append(f"        {fn_name}({neg_call})")
+                lines.append(f"        {_call_expr(fn_name, neg_call, is_async)}")
                 lines.append("")
 
     return "\n".join(lines)

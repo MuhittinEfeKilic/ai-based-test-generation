@@ -1,7 +1,16 @@
+"""Streamlit front-end: paste/upload code, generate tests, measure coverage.
+
+Security note: the target file is imported and its generated tests are executed
+in this process' Python environment. Only feed it code you trust.
+"""
+
+import logging
+import shutil
 import sys
 import time
-import shutil
+import traceback
 from pathlib import Path
+
 import streamlit as st
 
 #  PATHS
@@ -14,16 +23,72 @@ from analyzer.code_analyzer import CodeAnalyzer
 from test_generator.prompt_builder import build_test_plan, build_llm_prompt
 from test_generator.test_generator import generate_pytest_code, save_tests
 from cov_tools.coverage_analyzer import CoverageAnalyzer
+from web.formatting import (
+    count_tests,
+    download_name,
+    friendly_error,
+    function_rows,
+    get_temperature,
+    mode_label,
+)
 
 # LLM layer
-from llm import LLMConfig, generate_with_optional_llm
+from llm import (
+    API_KEY_SECRETS,
+    DEFAULT_MODELS,
+    PROVIDERS,
+    PROVIDER_LABELS,
+    SUPPORTS_BASE_URL,
+    LLMConfig,
+    generate_with_optional_llm,
+)
 
-#Editor with line numbers
+# Editor with line numbers
 try:
     from streamlit_ace import st_ace
     ACE_AVAILABLE = True
 except Exception:
     ACE_AVAILABLE = False
+
+log = logging.getLogger(__name__)
+
+GENERATED_TEST_NAME = "test_generated_from_ui.py"
+
+EXAMPLE_CODE = '''def calculate_discount(price, discount):
+    if price < 0:
+        raise ValueError("Price cannot be negative")
+
+    if discount < 0 or discount > 100:
+        raise ValueError("Discount must be between 0 and 100")
+
+    return price * (1 - discount / 100)
+
+
+def apply_bulk_pricing(items):
+    total = 0
+    for item in items:
+        total += item["quantity"] * item["price"]
+    if total > 100:
+        return total * 0.9
+    return total
+'''
+
+
+# --------------------------------------------------------------------------
+# Filesystem helpers
+# --------------------------------------------------------------------------
+
+def prune_tmp_targets(sample_dir: Path, keep: Path | None = None) -> int:
+    """Delete scratch modules from earlier runs, optionally sparing `keep`."""
+    removed = 0
+    if not sample_dir.exists():
+        return removed
+    for p in sample_dir.glob("tmp_target_*.py"):
+        if keep is not None and p.resolve() == keep.resolve():
+            continue
+        p.unlink(missing_ok=True)
+        removed += 1
+    return removed
 
 
 def clean_artifacts(project_root: Path) -> dict:
@@ -32,26 +97,22 @@ def clean_artifacts(project_root: Path) -> dict:
     uploads_dir = data_dir / "uploads"
     coverage_dir = data_dir / "coverage_html"
     generated_tests_dir = project_root / "tests" / "generated"
-    legacy_generated_dir = data_dir / "generated_tests"
 
     deleted = {
         "tmp_targets": 0,
         "uploads": 0,
         "coverage_html": False,
-        "generated_test_file": False,
+        "generated_test_files": 0,
         "errors": [],
     }
 
-    #tmp_target_#.py creation
+    # 1) scratch copies of the analysed module
     try:
-        if sample_dir.exists():
-            for p in sample_dir.glob("tmp_target_*.py"):
-                p.unlink(missing_ok=True)
-                deleted["tmp_targets"] += 1
+        deleted["tmp_targets"] = prune_tmp_targets(sample_dir)
     except Exception as e:
         deleted["errors"].append(f"tmp_targets: {e}")
 
-    #2)uploads/
+    # 2) uploads/
     try:
         if uploads_dir.exists():
             for p in uploads_dir.glob("*"):
@@ -63,7 +124,7 @@ def clean_artifacts(project_root: Path) -> dict:
     except Exception as e:
         deleted["errors"].append(f"uploads: {e}")
 
-    # 3)coverage_html/
+    # 3) coverage_html/
     try:
         if coverage_dir.exists():
             shutil.rmtree(coverage_dir, ignore_errors=True)
@@ -71,33 +132,34 @@ def clean_artifacts(project_root: Path) -> dict:
     except Exception as e:
         deleted["errors"].append(f"coverage_html: {e}")
 
-    # 4)generated test file
+    # 4) generated test files (UI and CLI both write here)
     try:
-        gen_file = generated_tests_dir / "test_generated_from_ui.py"
-        legacy_file = legacy_generated_dir / "test_generated_from_ui.py"
-        if gen_file.exists():
-            gen_file.unlink(missing_ok=True)
-            deleted["generated_test_file"] = True
-        if legacy_file.exists():
-            legacy_file.unlink(missing_ok=True)
-            deleted["generated_test_file"] = True
+        if generated_tests_dir.exists():
+            for gen_file in generated_tests_dir.glob("test_*.py"):
+                gen_file.unlink(missing_ok=True)
+                deleted["generated_test_files"] += 1
     except Exception as e:
-        deleted["errors"].append(f"generated_test_file: {e}")
+        deleted["errors"].append(f"generated_test_files: {e}")
 
     return deleted
 
 
-def get_temperature(label: str) -> float:
-    temp_map = {"Low": 0.1, "Medium": 0.4, "High": 0.8}
-    return temp_map.get(label, 0.2)
+# --------------------------------------------------------------------------
+# Small presentation helpers
+# --------------------------------------------------------------------------
+
+def read_secret(name: str) -> str | None:
+    """Read one entry from .streamlit/secrets.toml, tolerating no file at all."""
+    try:
+        return st.secrets.get(name, None)
+    except Exception:
+        # Streamlit raises when no secrets.toml exists; that is not an error here.
+        return None
 
 
 def sidebar_api_key(use_llm: bool, label: str, secret_name: str) -> str | None:
-    """
-    If secret exists -> do not render password input (avoids extra eye icon in most cases).
-    Else -> show password input (Streamlit eye is unavoidable; browser password manager may add its own).
-    """
-    secret_val = st.secrets.get(secret_name, None)
+    """Prefer the key from secrets; only prompt for it when there is none."""
+    secret_val = read_secret(secret_name)
     if secret_val:
         st.sidebar.success(f"{label}: loaded from secrets")
         return secret_val
@@ -106,13 +168,116 @@ def sidebar_api_key(use_llm: bool, label: str, secret_name: str) -> str | None:
         label,
         type="password",
         value="",
-        disabled=not use_llm
+        disabled=not use_llm,
     ).strip() or None
 
 
-st.set_page_config(page_title="AI Test Generator Prototype", layout="wide")
-st.title("AI-Based Automated Test Generation System (Prototype)")
-st.caption("Paste/Upload Python code → Analyze → Generate pytest → Run coverage")
+# --------------------------------------------------------------------------
+# Pipeline
+# --------------------------------------------------------------------------
+
+def run_pipeline(
+    target_path: Path,
+    sample_dir: Path,
+    generated_dir: Path,
+    use_llm: bool,
+    llm_cfg: LLMConfig,
+    source_name: str | None,
+) -> dict:
+    """Analyze -> plan -> generate -> save -> coverage. Returns what the UI shows."""
+    # A fresh module name per run keeps stale imports out of sys.modules.
+    unique_stem = f"tmp_target_{int(time.time())}"
+    tmp_target = sample_dir / f"{unique_stem}.py"
+    tmp_target.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
+    prune_tmp_targets(sample_dir, keep=tmp_target)
+    module_import = f"data.sample_code.{unique_stem}"
+
+    overview = CodeAnalyzer().analyze_module(str(target_path))
+    analysis = overview["functions"]
+
+    result = {
+        "module_import": module_import,
+        "overview": overview,
+        "analysis": analysis,
+        "source_name": source_name,
+    }
+
+    if not analysis:
+        result["empty"] = True
+        return result
+
+    test_plan = build_test_plan(analysis)
+    prompt = f"TARGET_MODULE_IMPORT={module_import}\n" + build_llm_prompt(test_plan)
+
+    generation_source = "rule-based"
+    llm_error = None
+    coverage_code = None
+
+    if use_llm:
+        llm_result = generate_with_optional_llm(prompt, llm_cfg)
+        if llm_result.source == "llm" and llm_result.code.strip():
+            pytest_code = llm_result.code
+            generation_source = "ai"
+            # Coverage is always measured with the deterministic tests so a
+            # brittle model answer cannot distort the metric.
+            coverage_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
+        else:
+            llm_error = llm_result.error
+            pytest_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
+            generation_source = "fallback"
+    else:
+        pytest_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
+
+    if coverage_code is None:
+        coverage_code = pytest_code
+
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = save_tests(coverage_code, generated_dir / GENERATED_TEST_NAME)
+
+    coverage = CoverageAnalyzer().run_coverage(
+        project_root=PROJECT_ROOT,
+        test_file=saved_path,
+        source_dir=sample_dir,
+        target_file=tmp_target,
+        html=True,
+    )
+
+    result.update(
+        {
+            "empty": False,
+            "test_plan": test_plan,
+            "prompt": prompt,
+            "pytest_code": pytest_code,
+            "coverage_code": coverage_code,
+            "generation_source": generation_source,
+            "llm_error": llm_error,
+            "saved_path": str(saved_path),
+            "coverage": coverage,
+        }
+    )
+    return result
+
+
+# --------------------------------------------------------------------------
+# Page
+# --------------------------------------------------------------------------
+
+st.set_page_config(page_title="AI-Powered Python Test Generator", layout="wide")
+
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 2.2rem; }
+      section[data-testid="stSidebar"] hr { margin: 0.9rem 0; }
+      div[data-testid="stMetricValue"] { font-size: 1.6rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("AI-Powered Python Test Generator")
+st.caption("Generate pytest tests and coverage reports from Python code in seconds.")
+st.caption("Add Python code → Analyze → Generate tests → Review coverage → Download")
 
 data_dir = PROJECT_ROOT / "data"
 sample_dir = data_dir / "sample_code"
@@ -123,117 +288,115 @@ uploads_dir = data_dir / "uploads"
 sample_dir.mkdir(parents=True, exist_ok=True)
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
-#Sidebar
+st.session_state.setdefault("editor_seed", 0)
+st.session_state.setdefault("editor_value", "")
+st.session_state.setdefault("last_run", None)
+st.session_state.setdefault("last_error", None)
+
+# ---- Sidebar: Input -------------------------------------------------------
 st.sidebar.header("Input")
 
-mode = st.sidebar.radio(
-    "Choose input mode",
-    ["Paste code", "Upload a .py file"]
-)
+mode = st.sidebar.radio("Source", ["Paste code", "Upload .py"], label_visibility="collapsed")
 
 uploaded = None
-if mode == "Upload a .py file":
-    uploaded = st.sidebar.file_uploader("Upload Python file", type=["py"])
+if mode == "Upload .py":
+    uploaded = st.sidebar.file_uploader("Upload a Python file", type=["py"])
 
-#Generation Settings (LLM optional)
+# ---- Sidebar: Test Generation --------------------------------------------
 st.sidebar.divider()
-st.sidebar.header("Generation Settings")
+st.sidebar.header("Test Generation")
 
-use_llm = st.sidebar.checkbox("Use LLM (optional)", value=False)
-
-#Providers requested
-PROVIDERS = ["mock", "gemini", "openai", "claude", "deepseek"]
-
-#Provider label above dropdown
-st.sidebar.markdown("**LLM Provider**")
-provider = st.sidebar.selectbox(
-    label="LLM Provider (hidden)",
-    options=PROVIDERS,
-    index=0,
-    disabled=not use_llm,
-    label_visibility="collapsed",
+use_llm = st.sidebar.checkbox("Use AI generation", value=False)
+st.sidebar.caption(
+    "Optional. If AI generation is unavailable, the system falls back to "
+    "rule-based test generation."
 )
 
-#Creativity (Complexity)
+provider = st.sidebar.selectbox(
+    "AI provider",
+    options=list(PROVIDERS),
+    index=0,
+    format_func=lambda p: PROVIDER_LABELS.get(p, p),
+    disabled=not use_llm,
+)
+
 temp_label = st.sidebar.radio(
     "Creativity",
     options=["Low", "Medium", "High"],
     index=0,
     disabled=not use_llm,
-    horizontal=True
+    horizontal=True,
 )
 temperature = get_temperature(temp_label)
 
-#Auto model selection (if no user model selection)
-DEFAULT_MODELS = {
-    "mock": "mock",
-    "openai": "gpt-4o-mini",
-    "gemini": "gemini-1.5-flash",
-    "claude": "claude-3-5-sonnet-latest",
-    "deepseek": "deepseek-chat",
-}
-model_name = DEFAULT_MODELS.get(provider, "mock")
+default_model = DEFAULT_MODELS.get(provider, "mock")
+model_name = st.sidebar.text_input(
+    "Model",
+    value=default_model,
+    disabled=not use_llm,
+    help="Override if the default model id is unavailable on your account.",
+).strip() or default_model
 
-# Provider-specific settings
 api_key = None
 base_url = None
+provider_label = PROVIDER_LABELS.get(provider, provider)
 
-if provider == "openai":
-    api_key = sidebar_api_key(use_llm, "OpenAI API Key", "OPENAI_API_KEY")
-    base_url = st.sidebar.text_input("OpenAI Base URL (optional)", value="", disabled=not use_llm).strip() or None
+secret_name = API_KEY_SECRETS.get(provider)
+if secret_name:
+    api_key = sidebar_api_key(use_llm, f"{provider_label} API key", secret_name)
 
-elif provider == "gemini":
-    api_key = sidebar_api_key(use_llm, "Gemini API Key", "GEMINI_API_KEY")
+if provider in SUPPORTS_BASE_URL:
+    base_url = st.sidebar.text_input(
+        f"{provider_label} base URL (optional)",
+        value="",
+        disabled=not use_llm,
+    ).strip() or None
 
-elif provider == "claude":
-    api_key = sidebar_api_key(use_llm, "Claude API Key", "ANTHROPIC_API_KEY")
-
-elif provider == "deepseek":
-    api_key = sidebar_api_key(use_llm, "DeepSeek API Key", "DEEPSEEK_API_KEY")
-    base_url = st.sidebar.text_input("DeepSeek Base URL (optional)", value="", disabled=not use_llm).strip() or None
-
-# mock => no key/base_url needed
-
-st.sidebar.caption("If LLM fails, the system automatically falls back to rule-based generation.")
-
-# Run/Clean
+# ---- Sidebar: actions -----------------------------------------------------
 st.sidebar.divider()
-run_btn = st.sidebar.button("Run Analysis → Generate Tests → Coverage", type="primary")
+run_btn = st.sidebar.button("Analyze & Generate Tests", type="primary", width="stretch")
 
-st.sidebar.divider()
-if st.sidebar.button("🧹 Clean temp files & reports"):
-    result = clean_artifacts(PROJECT_ROOT)
-    if result["errors"]:
-        st.sidebar.error("Clean completed with errors:")
-        for err in result["errors"]:
-            st.sidebar.write(f"- {err}")
-    else:
-        st.sidebar.success(
-            f"Cleaned: tmp_targets={result['tmp_targets']}, "
-            f"uploads={result['uploads']}, "
-            f"coverage_html={result['coverage_html']}, "
-            f"generated_test_file={result['generated_test_file']}"
-        )
+with st.sidebar.expander("Advanced"):
+    debug_mode = st.checkbox("Show technical details on error", value=False)
+    if st.button("Clean temp files & reports", width="stretch"):
+        cleaned = clean_artifacts(PROJECT_ROOT)
+        if cleaned["errors"]:
+            st.error("Clean completed with errors:")
+            for err in cleaned["errors"]:
+                st.write(f"- {err}")
+        else:
+            st.success(
+                f"Cleaned: {cleaned['tmp_targets']} scratch modules, "
+                f"{cleaned['uploads']} uploads, "
+                f"{cleaned['generated_test_files']} test files"
+            )
 
-#Main layout
-col1, col2 = st.columns(2)
+# ---- Main layout ----------------------------------------------------------
+col1, col2 = st.columns([1, 1], gap="large")
 
 pasted_code = ""
 target_path = None
-module_import = None
+source_name = None
 
 with col1:
-    st.subheader("Source Code")
+    st.subheader("Python source")
 
     if mode == "Paste code":
+        left, right = st.columns([1, 3])
+        with left:
+            if st.button("Load example", width="stretch"):
+                st.session_state.editor_value = EXAMPLE_CODE
+                st.session_state.editor_seed += 1
+        with right:
+            st.caption("Loads a sample with branches, a loop and validation errors.")
+
         if ACE_AVAILABLE:
-            st.caption("Editor: ACE (syntax highlighting + line numbers).")
             pasted_code = st_ace(
-                value="",
+                value=st.session_state.editor_value,
                 language="python",
-                theme="monokai",
-                key="ace_paste_editor",
-                height=460,
+                theme="tomorrow_night",
+                key=f"ace_paste_editor_{st.session_state.editor_seed}",
+                height=440,
                 font_size=14,
                 tab_size=4,
                 wrap=True,
@@ -242,136 +405,201 @@ with col1:
                 auto_update=True,
             )
         else:
-            st.caption("Tip: Install 'streamlit-ace' for syntax highlighting + line numbers.")
+            st.caption("Tip: install 'streamlit-ace' for syntax highlighting and line numbers.")
             pasted_code = st.text_area(
-                "Paste your Python code below",
-                height=420,
+                "Python code",
+                value=st.session_state.editor_value,
+                height=440,
                 placeholder="def foo(x):\n    return x + 1\n",
-                key="paste_code_main_fallback"
+                key=f"paste_code_fallback_{st.session_state.editor_seed}",
+                label_visibility="collapsed",
             )
 
         if pasted_code and pasted_code.strip():
             target_path = uploads_dir / "pasted_input.py"
             target_path.write_text(pasted_code, encoding="utf-8")
-        else:
-            target_path = None
 
-    else:  #Upload mode
+    else:  # Upload mode
         if uploaded is not None:
             target_path = uploads_dir / uploaded.name
             target_path.write_bytes(uploaded.getvalue())
+            source_name = uploaded.name
 
         if target_path and target_path.exists():
             st.code(target_path.read_text(encoding="utf-8"), language="python")
         else:
-            st.info("Upload a .py file from the sidebar.")
+            st.info("Upload a .py file from the sidebar to get started.")
 
+# ---- Run ------------------------------------------------------------------
+if run_btn:
+    st.session_state.last_error = None
+    if not target_path or not target_path.exists():
+        st.session_state.last_run = None
+        st.session_state.last_error = {
+            "message": "No Python code found. Paste code, load the example, or upload a file.",
+            "detail": None,
+        }
+    else:
+        llm_cfg = LLMConfig(
+            provider=provider if use_llm else "mock",
+            api_key=api_key,
+            model=model_name,
+            temperature=float(temperature),
+            timeout_sec=30,
+            base_url=base_url,
+        )
+        with st.spinner("Analyzing code, generating tests and measuring coverage..."):
+            try:
+                st.session_state.last_run = run_pipeline(
+                    target_path=target_path,
+                    sample_dir=sample_dir,
+                    generated_dir=generated_dir,
+                    use_llm=use_llm,
+                    llm_cfg=llm_cfg,
+                    source_name=source_name,
+                )
+            except Exception as exc:  # friendly message here, full detail in the log
+                log.exception("Test generation failed")
+                st.session_state.last_run = None
+                st.session_state.last_error = {
+                    "message": friendly_error(exc),
+                    "detail": traceback.format_exc(),
+                }
+
+# ---- Results --------------------------------------------------------------
 with col2:
-    st.subheader("Outputs")
+    st.subheader("Results")
 
-    if run_btn:
-        if mode == "Paste code" and (not pasted_code or not pasted_code.strip()):
-            st.error("No pasted code found. Please paste Python code in the editor on the left.")
-            st.stop()
+    run = st.session_state.last_run
+    error = st.session_state.last_error
 
-        if mode == "Upload a .py file" and (not target_path or not target_path.exists()):
-            st.error("No valid file uploaded.")
-            st.stop()
+    if error:
+        st.error(error["message"])
+        if debug_mode and error["detail"]:
+            st.code(error["detail"], language="text")
 
-        try:
-            unique_stem = f"tmp_target_{int(time.time())}"
-            tmp_target = sample_dir / f"{unique_stem}.py"
-            tmp_target.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
-            module_import = f"data.sample_code.{unique_stem}"
+    elif run is None:
+        st.info("Add Python code or load the example to generate automated pytest tests.")
+        st.caption(
+            "Generated tests are written to tests/generated/ and executed under "
+            "coverage.py. The target module is imported locally, so only run code you trust."
+        )
 
-            st.info(f"Target module: {module_import}")
+    elif run["empty"]:
+        classes = run["overview"]["classes"]
+        skipped = run["overview"]["skipped_methods"]
+        st.warning("No testable functions found.")
+        if classes:
+            st.caption(
+                f"Found {len(classes)} class(es) with {skipped} method(s). "
+                "Only module-level functions can be imported by name, so methods are skipped."
+            )
+        else:
+            st.caption("Add at least one module-level `def` to generate tests.")
 
-            #1)Analysis
-            analyzer = CodeAnalyzer()
-            analysis = analyzer.analyze_as_dict(str(target_path))
-            st.markdown("### 1) Analysis Output")
-            st.json(analysis)
+    else:
+        cov = run["coverage"]
+        counts = cov.counts
+        label = mode_label(run["generation_source"], PROVIDER_LABELS.get(provider, provider))
 
-            #2)Test plan
-            test_plan = build_test_plan(analysis)
-            st.markdown("### 2) Test Plan")
-            st.json(test_plan)
+        # When the AI wrote the displayed suite, the executed suite is the
+        # rule-based one - label the metrics so the two counts cannot be misread
+        # as contradicting each other.
+        executed_is_shown = run["coverage_code"] == run["pytest_code"]
+        passed_label = "Passed" if executed_is_shown else "Passed (rule-based)"
 
-            #3)Prompt
-            prompt = build_llm_prompt(test_plan)
-            prompt = f"TARGET_MODULE_IMPORT={module_import}\n" + prompt
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "Tests",
+            count_tests(run["pytest_code"]),
+            help="Test functions in the suite shown under 'Generated tests'.",
+        )
+        m2.metric(
+            passed_label,
+            f"{counts.get('passed', 0)}/{cov.total_tests}",
+            help="Results of the suite that was executed under coverage.py.",
+        )
+        m3.metric("Coverage", f"{cov.percent:.0f}%" if cov.percent is not None else "n/a")
+        m4.metric("Mode", label)
 
-            st.markdown("### 3) LLM Prompt")
-            st.code(prompt)
+        if run["llm_error"]:
+            st.warning(f"AI generation unavailable, used rule-based tests: {run['llm_error']}")
+        elif cov.ok:
+            st.success("Tests generated and executed successfully.")
+        else:
+            st.warning("Some generated tests failed. See the Coverage tab for details.")
 
-            #4)Generate pytest code
-            llm_cfg = LLMConfig(
-                provider=provider if use_llm else "mock",
-                api_key=api_key,
-                model=model_name,
-                temperature=float(temperature),
-                timeout_sec=30,
-                base_url=base_url,
+        tab_analysis, tab_tests, tab_coverage = st.tabs(
+            ["Analysis", "Generated tests", "Coverage"]
+        )
+
+        with tab_analysis:
+            overview = run["overview"]
+            plan_functions = run["test_plan"]["functions"]
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Functions", len(overview["functions"]))
+            a2.metric("Classes", len(overview["classes"]))
+            a3.metric(
+                "Test targets",
+                sum(len(fn.get("recommended_scenarios", [])) for fn in plan_functions),
             )
 
-            generated_source = "rule-based"
-            llm_error = None
-            coverage_code = None
+            if overview["skipped_methods"]:
+                st.caption(
+                    f"{overview['skipped_methods']} class method(s) skipped - only "
+                    "module-level functions are importable by name."
+                )
 
-            if use_llm:
-                llm_result = generate_with_optional_llm(prompt, llm_cfg)
-                if llm_result.source == "llm" and llm_result.code.strip():
-                    pytest_code = llm_result.code
-                    generated_source = "llm"
-                    coverage_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
-                else:
-                    llm_error = llm_result.error
-                    pytest_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
-                    generated_source = "fallback(rule-based)"
-            else:
-                pytest_code = generate_pytest_code(test_plan=test_plan, module_import=module_import)
-                generated_source = "rule-based"
-            if coverage_code is None:
-                coverage_code = pytest_code
+            st.dataframe(function_rows(plan_functions), width="stretch", hide_index=True)
 
-            st.markdown("### 4) Generated Pytest Code")
-            st.info(f"Generation Source: {generated_source}")
-            if llm_error:
-                st.warning(f"LLM not used: {llm_error}")
-            if generated_source == "llm":
-                st.info("Coverage will use safe rule-based tests to avoid brittle inputs.")
+            with st.expander("Test plan (JSON)"):
+                st.json(run["test_plan"])
+            with st.expander("Raw analysis (JSON)"):
+                st.json(run["analysis"])
+            with st.expander("AI prompt"):
+                st.code(run["prompt"], language="text")
 
-            st.code(pytest_code, language="python")
-
-            #5)Save tests
-            generated_dir.mkdir(parents=True, exist_ok=True)
-            out_file = generated_dir / "test_generated_from_ui.py"
-            saved_path = save_tests(coverage_code, out_file)
-            st.success(f"Saved test file: {saved_path}")
+        with tab_tests:
+            st.caption(f"Target module: `{run['module_import']}`")
+            st.code(run["pytest_code"], language="python")
 
             st.download_button(
-                label="Download generated test file",
-                data=coverage_code,
-                file_name="test_generated_from_ui.py",
+                "Download generated tests",
+                data=run["pytest_code"],
+                file_name=download_name(run["source_name"]),
                 mime="text/x-python",
+                type="primary",
             )
 
-            #6)Coverage
-            st.markdown("### 5) Coverage")
-            cov = CoverageAnalyzer()
-            cov.run_coverage(
-                project_root=PROJECT_ROOT,
-                test_file=saved_path,
-                source_dir=sample_dir,
-                html=True,
-            )
+            if run["coverage_code"] != run["pytest_code"]:
+                st.caption(
+                    "Coverage was measured with the deterministic rule-based suite "
+                    "so a brittle AI answer cannot distort the metric."
+                )
+                st.download_button(
+                    "Download rule-based tests (used for coverage)",
+                    data=run["coverage_code"],
+                    file_name="test_rule_based.py",
+                    mime="text/x-python",
+                )
+
+            st.caption(f"Saved to: `{run['saved_path']}`")
+
+        with tab_coverage:
+            if cov.percent is not None:
+                st.metric("Line coverage", f"{cov.percent:.0f}%")
+                st.progress(min(cov.percent / 100, 1.0))
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Passed", counts.get("passed", 0))
+            c2.metric("Failed", counts.get("failed", 0) + counts.get("error", 0))
+            c3.metric("Total", cov.total_tests)
+
+            if cov.report:
+                st.code(cov.report, language="text")
+            if not cov.ok and cov.pytest_output:
+                with st.expander("Test run output", expanded=True):
+                    st.code(cov.pytest_output, language="text")
 
             if coverage_html.exists():
-                st.success("Coverage completed")
-                st.info(f"HTML report path: {coverage_html}")
-            else:
-                st.warning("Coverage completed, but HTML report file was not found.")
-
-        except Exception as e:
-            st.error("Run failed")
-            st.exception(e)
+                st.caption(f"HTML report: `{coverage_html}`")

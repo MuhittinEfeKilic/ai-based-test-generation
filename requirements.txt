@@ -1,7 +1,11 @@
+# Core
 pytest>=7.4
 coverage>=7.4
 streamlit>=1.31
 streamlit-ace>=0.1.1
-openai>=1.0.0
+
+# Optional LLM providers - only needed for the provider you actually select.
+# "mock" works with none of these installed.
+openai>=1.0.0            # openai + deepseek (OpenAI-compatible endpoint)
 google-generativeai>=0.7.0
 anthropic>=0.30.0

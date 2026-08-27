@@ -1,4 +1,28 @@
+# Environments
 .venv/
-__pycache__/
-.idea/
+venv/
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors
+.idea/
+.vscode/
+
+# Test & coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+data/coverage_html/
+
+# Runtime artifacts produced by the app
+data/sample_code/tmp_target_*.py
+data/uploads/
+tests/generated/*.py
+!tests/generated/.gitkeep
+
+# Local secrets (use secrets.toml.example as the template)
+.streamlit/secrets.toml

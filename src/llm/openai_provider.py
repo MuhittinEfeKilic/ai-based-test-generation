@@ -1,8 +1,17 @@
 from __future__ import annotations
+
 from .provider import LLMConfig
+
+SYSTEM_PROMPT = "You generate pytest unit tests. Return only python code."
 
 
 class OpenAIProvider:
+    """Chat-completions provider for any OpenAI-compatible endpoint.
+
+    DeepSeek speaks the same protocol, so it reuses this class with a
+    different ``base_url`` rather than a duplicated implementation.
+    """
+
     def __init__(self, config: LLMConfig):
         self.config = config
 
@@ -14,7 +23,7 @@ class OpenAIProvider:
             model=self.config.model,
             temperature=self.config.temperature,
             messages=[
-                {"role": "system", "content": "You generate pytest unit tests. Return only python code."},
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             timeout=self.config.timeout_sec,
