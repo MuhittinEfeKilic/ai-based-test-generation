@@ -82,6 +82,20 @@ def missing_key_message(provider: str, env_var: str) -> str:
     )
 
 
+def project_relative(path: Path | str, root: Path | str) -> str:
+    """Render a path relative to the project root.
+
+    Absolute paths in the UI are noise and leak the operating-system user name
+    in screenshots and screen shares; the repo-relative form is what a reader
+    actually needs.
+    """
+    path = Path(path)
+    try:
+        return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+    except (ValueError, OSError):
+        return path.name
+
+
 def coverage_grade(percent: float | None) -> tuple[str, str]:
     """(label, css tone) for a coverage percentage."""
     if percent is None:
@@ -243,7 +257,7 @@ def structure_table_html(functions: list[dict]) -> str:
 
         rows.append(
             f'<tr><td class="name">{escape(fn["name"])}</td>'
-            f"<td>{escape(args) if args != '&ndash;' else args}</td>"
+            f'<td class="args">{escape(args) if args != "&ndash;" else args}</td>' 
             f"<td>{returns_text}</td>"
             f"<td>{traits_html}</td>"
             f'<td>{len(fn.get("recommended_scenarios", []))}</td></tr>'

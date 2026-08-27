@@ -67,7 +67,12 @@ def infer_dict_keys_from_ast(function_source: str) -> set[str]:
 
 def _infer_param_guards(function_source: str, param_names: List[str]) -> Dict[str, Dict[str, bool]]:
     flags: Dict[str, Dict[str, bool]] = {
-        name: {"divisor": False, "zero_checked": False, "negative_checked": False}
+        name: {
+            "divisor": False,
+            "zero_checked": False,
+            "negative_checked": False,
+            "nonpositive_checked": False,
+        }
         for name in param_names
     }
     if not function_source or not param_names:
@@ -92,6 +97,11 @@ def _infer_param_guards(function_source: str, param_names: List[str]) -> Dict[st
                     if isinstance(other, ast.Constant) and other.value == 0:
                         if any(isinstance(op, (ast.Lt, ast.LtE)) for op in node.ops):
                             flags[side.id]["negative_checked"] = True
+                        # `x <= 0` rejects zero too, so zero is not a safe input.
+                        if side is node.left and any(
+                            isinstance(op, ast.LtE) for op in node.ops
+                        ):
+                            flags[side.id]["nonpositive_checked"] = True
                         if any(isinstance(op, ast.Eq) for op in node.ops):
                             flags[side.id]["zero_checked"] = True
     return flags
@@ -267,7 +277,7 @@ def _build_arg_candidates(
     kind = _normalize_annotation(param_annotation)
     if kind == "unknown" and usage_kind:
         if usage_kind == "numeric":
-            return [1, 0, -1]
+            return [1, 0, -1, 2]
         if usage_kind == "list_dict":
             base = _build_dict_from_keys(inferred_keys)
             return [[base], [base, base]]
@@ -480,6 +490,8 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
                 candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c == 0)]
             if has_negative_check or raises_value_error or flags.get("negative_checked"):
                 candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c < 0)]
+            if flags.get("nonpositive_checked"):
+                candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c <= 0)]
             if not candidates:
                 candidates = [build_safe_arg_value(a, hint, inferred_keys, usage_kinds.get(a))]
             arg_candidates.append(candidates)

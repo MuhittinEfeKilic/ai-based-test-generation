@@ -138,3 +138,35 @@ def test_usage_inference_does_not_override_annotations(tmp_path, monkeypatch):
     )
 
     assert "shout('text')" in code
+
+
+def test_nonpositive_guard_excludes_zero_not_just_negatives(tmp_path, monkeypatch):
+    """`price <= 0` rejects zero, so zero is not a safe input either."""
+    code = generate(
+        tmp_path,
+        monkeypatch,
+        "checkout.py",
+        "def charge(price):\n"
+        "    if price <= 0:\n"
+        "        raise ValueError('Price must be greater than zero')\n"
+        "    return price * 2\n",
+    )
+
+    assert "charge(0)" not in code
+    assert "charge(1)" in code
+    assert "charge(-1)" in code  # still exercised via pytest.raises
+
+
+def test_strict_negative_guard_still_allows_zero(tmp_path, monkeypatch):
+    """`amount < 0` accepts zero, so zero stays a valid case."""
+    code = generate(
+        tmp_path,
+        monkeypatch,
+        "wallet.py",
+        "def withdraw(amount):\n"
+        "    if amount < 0:\n"
+        "        raise ValueError('negative')\n"
+        "    return amount\n",
+    )
+
+    assert "withdraw(0)" in code

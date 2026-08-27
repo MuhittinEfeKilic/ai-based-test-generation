@@ -161,13 +161,13 @@ h1, h2, h3, h4 { color: var(--text); letter-spacing: -0.01em; }
 /* ---- metric cards ------------------------------------------------------- */
 .tg-metrics {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(82px, 1fr));
   gap: 0.5rem;
   margin-bottom: 0.9rem;
 }
 
 .tg-metric {
-  padding: 0.55rem 0.65rem;
+  padding: 0.5rem 0.55rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -248,13 +248,13 @@ h1, h2, h3, h4 { color: var(--text); letter-spacing: -0.01em; }
 table.tg-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   font-family: var(--mono);
 }
 
 table.tg-table th {
   text-align: left;
-  padding: 0.4rem 0.6rem;
+  padding: 0.35rem 0.4rem;
   color: var(--text-faint);
   font-weight: 500;
   font-size: 0.68rem;
@@ -265,10 +265,17 @@ table.tg-table th {
 }
 
 table.tg-table td {
-  padding: 0.4rem 0.6rem;
+  padding: 0.35rem 0.4rem;
   color: var(--text-muted);
   border-bottom: 1px solid var(--surface-3);
   white-space: nowrap;
+}
+
+/* Argument lists are the only cell long enough to push the table wide. */
+table.tg-table td.args {
+  white-space: normal;
+  word-break: break-word;
+  min-width: 4.5rem;
 }
 
 table.tg-table td.name { color: var(--text); }

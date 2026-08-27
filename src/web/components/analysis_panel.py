@@ -20,9 +20,9 @@ def render(analysis, plan_functions: list[dict], generated_tests: int | None) ->
     metrics = analysis.metrics
     cards = [
         ("Functions", metrics["functions"], "accent"),
-        ("Branches", metrics["branches"], ""),
-        ("Loops", metrics["loops"], ""),
-        ("Raises", metrics["raises"], ""),
+        ("With branches", metrics["branches"], ""),
+        ("With loops", metrics["loops"], ""),
+        ("With raises", metrics["raises"], ""),
         ("Async", metrics["async"], ""),
     ]
     if generated_tests is not None:

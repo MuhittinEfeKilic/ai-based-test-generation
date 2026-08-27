@@ -197,7 +197,11 @@ if generation is not None:
         run_clicked = test_results.render_execution(execution, can_run=True)
 
     with cov_col:
-        coverage_panel.render(execution, workspace.coverage_html / "index.html")
+        coverage_panel.render(
+            execution,
+            workspace.coverage_html / "index.html",
+            PROJECT_ROOT,
+        )
 
     if run_clicked:
         status = st.status("Running tests...", expanded=True)

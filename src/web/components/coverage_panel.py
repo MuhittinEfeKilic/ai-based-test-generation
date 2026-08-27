@@ -10,10 +10,11 @@ from formatting import (
     coverage_files_table_html,
     coverage_panel_html,
     panel_title_html,
+    project_relative,
 )
 
 
-def render(execution, html_index: Path) -> None:
+def render(execution, html_index: Path, project_root: Path) -> None:
     st.markdown(panel_title_html("Coverage Report", "coverage.py"), unsafe_allow_html=True)
 
     if execution is None:
@@ -39,4 +40,4 @@ def render(execution, html_index: Path) -> None:
             st.code(execution.report, language="text")
 
     if html_index.exists():
-        st.caption(f"HTML report: `{html_index}`")
+        st.caption(f"HTML report: `{project_relative(html_index, project_root)}`")

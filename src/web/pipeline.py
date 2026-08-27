@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -125,7 +126,9 @@ def stage_target_module(target_path: Path, sample_dir: Path) -> tuple[Path, str]
     copies are removed so they cannot pollute later coverage runs.
     """
     sample_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"tmp_target_{int(time.time() * 1000)}"
+    # The random suffix matters: the clock alone collides when two runs land in
+    # the same millisecond, which would reuse a module name already in sys.modules.
+    stem = f"tmp_target_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     tmp_target = sample_dir / f"{stem}.py"
     tmp_target.write_text(target_path.read_text(encoding="utf-8"), encoding="utf-8")
     prune_tmp_targets(sample_dir, keep=tmp_target)

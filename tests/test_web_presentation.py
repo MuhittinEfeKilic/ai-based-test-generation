@@ -9,6 +9,7 @@ from web.formatting import (
     coverage_panel_html,
     metric_cards_html,
     missing_key_message,
+    project_relative,
     provider_status,
     steps_html,
     structure_table_html,
@@ -198,3 +199,26 @@ def test_parse_coverage_json_extracts_totals_and_files():
 def test_parse_coverage_json_survives_garbage():
     assert parse_coverage_json("not json") == {}
     assert parse_coverage_json("") == {}
+
+
+# ---- paths shown in the UI ------------------------------------------------
+
+def test_paths_are_shown_relative_to_the_project(tmp_path):
+    root = tmp_path / "project"
+    target = root / "data" / "coverage_html" / "index.html"
+    target.parent.mkdir(parents=True)
+    target.write_text("x", encoding="utf-8")
+
+    assert project_relative(target, root) == "data/coverage_html/index.html"
+
+
+def test_paths_outside_the_project_fall_back_to_the_bare_name(tmp_path):
+    """Never leak an absolute path - and therefore never the OS user name."""
+    outside = tmp_path / "elsewhere" / "report.html"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("x", encoding="utf-8")
+
+    rendered = project_relative(outside, tmp_path / "project")
+
+    assert rendered == "report.html"
+    assert "\\" not in rendered and "/" not in rendered
