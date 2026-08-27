@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -10,6 +11,14 @@ _COUNT_RE = re.compile(r"(\d+)\s+(passed|failed|error|errors|skipped)\b")
 
 
 @dataclass
+class FileCoverage:
+    path: str
+    statements: int
+    missing: int
+    percent: float
+
+
+@dataclass
 class CoverageResult:
     ok: bool
     report: str
@@ -17,12 +26,53 @@ class CoverageResult:
     html_dir: Path | None = None
     percent: float | None = None
     counts: dict[str, int] = field(default_factory=dict)
+    statements: int | None = None
+    missing: int | None = None
+    files: list[FileCoverage] = field(default_factory=list)
 
     @property
     def total_tests(self) -> int:
         return sum(
             self.counts.get(key, 0) for key in ("passed", "failed", "error", "skipped")
         )
+
+    @property
+    def covered(self) -> int | None:
+        if self.statements is None or self.missing is None:
+            return None
+        return self.statements - self.missing
+
+
+def parse_coverage_json(payload: str) -> dict:
+    """Structured totals from `coverage json`, or {} when unavailable.
+
+    Branch coverage is never reported: the runs here are statement-only, and
+    claiming otherwise would be a fabricated metric.
+    """
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError):
+        return {}
+
+    totals = data.get("totals") or {}
+    files = []
+    for path, entry in (data.get("files") or {}).items():
+        summary = entry.get("summary") or {}
+        files.append(
+            FileCoverage(
+                path=path,
+                statements=summary.get("num_statements", 0),
+                missing=summary.get("missing_lines", 0),
+                percent=summary.get("percent_covered", 0.0),
+            )
+        )
+
+    return {
+        "percent": totals.get("percent_covered"),
+        "statements": totals.get("num_statements"),
+        "missing": totals.get("missing_lines"),
+        "files": sorted(files, key=lambda f: f.path),
+    }
 
 
 def parse_pytest_counts(output: str) -> dict[str, int]:
@@ -105,7 +155,10 @@ class CoverageAnalyzer:
         )
         report = (report_proc.stdout or "") + (report_proc.stderr or "")
 
-        percent = self._total_percent(py, project_root)
+        totals = self._json_totals(py, project_root)
+        percent = totals.get("percent")
+        if percent is None:
+            percent = self._total_percent(py, project_root)
 
         # 3) HTML report
         html_dir = None
@@ -127,7 +180,20 @@ class CoverageAnalyzer:
             html_dir=html_dir,
             percent=percent,
             counts=parse_pytest_counts(pytest_output),
+            statements=totals.get("statements"),
+            missing=totals.get("missing"),
+            files=totals.get("files", []),
         )
+
+    def _json_totals(self, py: str, project_root: Path) -> dict:
+        """Per-file and total statement counts, straight from coverage.py."""
+        proc = subprocess.run(
+            [py, "-m", "coverage", "json", "-o", "-"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+        )
+        return parse_coverage_json(proc.stdout or "")
 
     def _total_percent(self, py: str, project_root: Path) -> float | None:
         """Ask coverage.py for the single total number, or None if unavailable."""

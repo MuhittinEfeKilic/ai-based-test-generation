@@ -1,102 +1,122 @@
-# AI-Powered Python Test Generator
+# TestGen - AI-Powered Python Test Generator
 
-A developer tool that turns Python source code into a runnable pytest suite.
-Paste or upload a module and it analyzes the code, generates tests, executes
-them, and reports line coverage - optionally using an AI provider to write the
-tests, with a deterministic generator as the fallback.
+A developer tool that turns Python source into a runnable pytest suite. Paste or
+upload a module and TestGen analyzes it, generates tests, executes them, and
+reports statement coverage - with optional AI assistance on top of a
+deterministic generator that always runs.
 
 ## Features
 
 - **Static analysis** of module-level functions with Python's `ast`: branches,
   loops, printed output, raised errors, `async def`, defaults and annotations
-- **Rule-based test generation** that picks inputs which will not trip the code
+- **Deterministic generation** that picks inputs which will not trip the code
   under test - no `0` for divisors, no negatives for validated parameters, dict
   shapes inferred from subscripts, and parameter types inferred from how the
   body uses them when annotations are absent
-- **Optional AI generation** via mock / OpenAI / Gemini / Claude / DeepSeek,
-  validated before use and falling back to the rule-based generator on any
-  failure (missing key, network error, non-code answer, code that will not parse)
+- **AI-assisted generation** as an additive second suite, validated before it is
+  shown, with automatic fallback when a provider is unavailable
 - **Scenario coverage**: branches, loops, `pytest.raises` for validation errors,
   `capsys` for printed output, `asyncio.run` for coroutines
-- **Test execution and line coverage** through coverage.py, with an HTML report
-- **Streamlit UI** with a code editor, a loadable example, per-run metrics
-  (tests, passed, coverage, generation mode) and downloadable test files
+- **Test execution and statement coverage** through pytest and coverage.py, with
+  pass/fail counts, per-file figures and an HTML report
+- **Dark developer UI** with a code editor, loadable samples, a workflow
+  indicator, and downloadable test files
 
-## How it works
+## Deterministic vs AI-assisted
 
-```
-source.py
-   │
-   ├─ analyzer/          ast → FunctionInfo (branches, loops, prints, raises, async)
-   ├─ test_generator/    FunctionInfo → test plan → pytest source (+ AI prompt)
-   ├─ llm/               optional provider call, validated & fenced-code stripped
-   └─ cov_tools/         coverage run / report / html in a child process
-```
+| | Deterministic | AI assisted |
+| --- | --- | --- |
+| Source | AST analysis + rules | Language model, prompted with the plan and the function bodies |
+| Repeatable | Yes | No |
+| Needs network / API key | No | Yes (except the `mock` provider) |
+| Executed by the app | **Yes** | No - shown and downloadable only |
+| Counted in coverage | Yes | No |
 
-When AI generation is used its output is shown and downloadable, but **coverage
-is always measured with the deterministic rule-based tests**, so an unreliable
-model answer cannot distort the metric.
+AI mode does not replace deterministic generation: both suites are produced and
+presented in tabs. The deterministic suite is the one written to
+`tests/generated/`, executed, and measured, so an unreliable model answer can
+neither distort the coverage number nor run in your environment. If the provider
+fails for any reason - missing key, network error, non-code answer, code that
+does not parse - the app says so plainly and you still get the deterministic
+tests.
+
+## Supported providers
+
+| Provider | Key (secret name) | Notes |
+| --- | --- | --- |
+| `mock` | none | Local stub, useful for demos and tests |
+| `openai` | `OPENAI_API_KEY` | Custom base URL supported |
+| `gemini` | `GEMINI_API_KEY` | |
+| `claude` | `ANTHROPIC_API_KEY` | |
+| `deepseek` | `DEEPSEEK_API_KEY` | OpenAI-compatible endpoint |
+
+Default model ids may drift; override them in the **Model** field.
 
 ## Requirements
 
 - Python 3.11+
 - pip
 
-Provider SDKs in `requirements.txt` are optional; the `mock` provider needs none
-of them.
+Provider SDKs in `requirements.txt` are optional - the `mock` provider needs
+none of them.
 
 ## Setup
 
 ```bash
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
+```
 
+```bash
+.venv\Scripts\activate
+```
+
+```bash
 pip install -r requirements.txt
 ```
 
-### API keys (optional)
+On macOS/Linux activate with `source .venv/bin/activate` instead.
 
-Copy the template and fill in only the providers you use:
+### Configuration
+
+API keys are read from `.streamlit/secrets.toml`, which is git-ignored:
 
 ```bash
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 ```
 
-`secrets.toml` is git-ignored. Keys can also be typed into the sidebar at
-runtime; a key found in secrets takes precedence.
+Fill in only the providers you use. A key can also be typed into the panel at
+runtime; it is held in the session only, never written to disk, echoed back, or
+logged. A key found in secrets takes precedence.
 
-## Screenshots
+Optional environment variables:
 
-Screenshots are not committed. To produce the three the README expects, run the
-app, load the example, click **Analyze & Generate Tests**, and capture:
-
-| File | What to capture |
+| Variable | Effect |
 | --- | --- |
-| `docs/screenshots/01-main.png` | The main screen with code in the editor and the sidebar visible |
-| `docs/screenshots/02-generated-tests.png` | The **Generated tests** tab showing the produced pytest file |
-| `docs/screenshots/03-coverage.png` | The **Coverage** tab with the percentage and the coverage.py report |
-
-Then reference them here with `![Main screen](docs/screenshots/01-main.png)`.
+| `TESTGEN_REPO_URL` | Shows a repository link in the application header |
 
 ## Running
-
-Start the UI:
 
 ```bash
 streamlit run src/web/app.py
 ```
 
-Then: paste code (or click **Load example**), or upload a `.py` file, and press
-**Analyze & Generate Tests**. Results appear on the right as a metric row plus
-three tabs - **Analysis**, **Generated tests** and **Coverage**. Generated tests
-can be downloaded from the Generated tests tab. **Advanced → Clean temp files &
-reports** removes the scratch modules, uploads, generated test files and the
-HTML report.
+### Workflow
 
-Or run the same pipeline from the command line:
+`Source -> Analyze -> Generate -> Run -> Coverage`
+
+1. Paste code, click a sample button, or upload a `.py` file.
+2. Pick **Deterministic** or **AI Assisted** in the configuration panel.
+3. Press **Analyze & Generate Tests** to see the analysis, detected structure
+   and generated suite.
+4. Press **Run Tests** to execute them and produce the coverage report.
+5. Download the generated `.py` from the Generated Tests section.
+
+Editing the source marks existing results as stale rather than silently leaving
+mismatched data on screen; re-run to refresh them.
+
+### Command line
+
+The same pipeline, without the UI:
 
 ```bash
 python src/main.py
@@ -105,6 +125,20 @@ python src/main.py
 ```bash
 python src/main.py path/to/your_module.py
 ```
+
+## Screenshots
+
+Screenshots are not committed. To capture the three the README references, run
+the app, click the **Calculator** sample, then **Analyze & Generate Tests**, then
+**Run Tests**:
+
+| Path | What to capture |
+| --- | --- |
+| `docs/screenshots/01-main.png` | Header, editor with code, configuration panel and analysis summary |
+| `docs/screenshots/02-generated-tests.png` | The Generated Tests section with the deterministic/AI tabs |
+| `docs/screenshots/03-coverage.png` | Test execution counts beside the coverage report |
+
+Then reference them here, for example `![Main workspace](docs/screenshots/01-main.png)`.
 
 ## Running the generated tests manually
 
@@ -119,43 +153,33 @@ pytest
 RUN_UI_GENERATED=1 pytest tests/generated -q
 ```
 
-Coverage by hand:
-
-```bash
-python -m coverage run --source=data/sample_code -m pytest tests/generated -q
-```
-
-```bash
-python -m coverage report -m
-```
-
-```bash
-python -m coverage html
-```
-
 ## Layout
 
 | Path | Contents |
 | --- | --- |
 | `src/analyzer/` | AST parsing and function metadata |
-| `src/test_generator/` | Test plan, AI prompt, rule-based pytest emitter |
+| `src/test_generator/` | Test plan, AI prompt, deterministic pytest emitter |
 | `src/llm/` | Provider adapters and the fallback-safe service |
-| `src/cov_tools/` | coverage.py driver |
-| `src/web/` | Streamlit UI and its presentation helpers |
-| `data/sample_code/example.py` | Bundled sample target |
+| `src/cov_tools/` | coverage.py driver and result parsing |
+| `src/web/app.py` | Streamlit entry point (orchestration only) |
+| `src/web/pipeline.py` | Backend glue: staging, analysis, generation, execution |
+| `src/web/components/` | One module per UI panel |
+| `src/web/styles.py` | The single stylesheet |
+| `src/web/state.py` | Session state and staleness handling |
+| `data/sample_code/example.py` | Bundled sample target for the CLI |
 | `tests/` | The project's own test suite |
 | `tests/generated/` | Generated output (git-ignored) |
 
 ## Known limitations
 
 - **Only module-level functions.** Class methods and nested functions are
-  skipped, because generated tests import functions by name.
-- **The target module is imported and its tests are executed locally.** Top-level
-  side effects in the analyzed file will run. Only feed it code you trust.
-- Rule-based assertions are structural (`result is not None`); they prove the
+  skipped, because generated tests import functions by name. The UI says so when
+  it happens.
+- **The analyzed module is imported and the deterministic suite is executed
+  locally.** Top-level side effects in the analyzed file will run. Only analyze
+  code you trust. AI-generated code is never executed.
+- **Statement coverage only.** Branch coverage is not measured and is not
+  reported.
+- Deterministic assertions are structural (`result is not None`); they prove the
   code runs on a given input, not that its output is correct. Concrete value
   assertions are what the AI path is for.
-- When AI generation is used, the AI suite is what you see and download, but
-  coverage is measured with the deterministic rule-based suite so an unreliable
-  answer cannot distort the metric. Both files are downloadable.
-- Default model ids may drift; override them in the sidebar's **Model** field.

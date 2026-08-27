@@ -89,15 +89,25 @@ def test_download_name_falls_back_for_pasted_code():
     assert download_name("pasted_input.py") == "test_generated.py"
 
 
-def test_syntax_error_gets_its_own_message():
-    assert "not valid Python" in friendly_error(SyntaxError("bad"))
+def test_syntax_error_message_surfaces_the_line():
+    exc = SyntaxError("expected ':'")
+    exc.lineno = 14
+
+    assert friendly_error(exc) == "Python syntax error on line 14: expected ':'"
+
+
+def test_syntax_error_without_a_line_still_reads_cleanly():
+    assert friendly_error(SyntaxError("invalid syntax")) == "Python syntax error: invalid syntax"
+
+
+def test_unknown_failures_get_a_generic_message():
     assert "Test generation failed" in friendly_error(RuntimeError("boom"))
 
 
-def test_mode_label_names_the_provider():
-    assert mode_label("ai", "Claude") == "AI (Claude)"
-    assert mode_label("fallback", "Claude") == "Rule-based (AI fallback)"
-    assert mode_label("rule-based", "Claude") == "Rule-based"
+def test_mode_label_distinguishes_generation_modes():
+    assert mode_label("deterministic") == "Deterministic"
+    assert mode_label("ai") == "AI assisted"
+    assert mode_label("fallback") == "Deterministic (AI fallback)"
 
 
 def test_temperature_defaults_for_unknown_label():
