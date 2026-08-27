@@ -23,6 +23,17 @@ def generate(tmp_path, monkeypatch, filename: str, source: str) -> str:
     return generate_pytest_code(plan, module_path.stem)
 
 
+def plain_calls(code: str) -> str:
+    """The generated code with every `pytest.raises` test removed.
+
+    Values that trip a guard are legitimate inside an exception test but must
+    never appear as an ordinary call, so the two need to be told apart.
+    """
+    separator = "\ndef "
+    blocks = code.split(separator)
+    return separator.join(b for b in blocks if "pytest.raises" not in b)
+
+
 def test_list_dict_infers_keys(tmp_path, monkeypatch):
     code = generate(
         tmp_path,
@@ -49,7 +60,8 @@ def test_print_path_adds_capsys_assert(tmp_path, monkeypatch):
     )
 
     assert "capsys" in code
-    assert "assert 'hello' in captured.out" in code
+    # The probe captured the real output, so the assertion can be exact.
+    assert r"assert captured.out == 'hello text\n'" in code
 
 
 def test_negative_value_generates_raises(tmp_path, monkeypatch):
@@ -95,8 +107,11 @@ def test_unannotated_numeric_param_is_not_given_a_string(tmp_path, monkeypatch):
 
     assert "calculate_discount('', '')" not in code
     assert "calculate_discount(None, None)" not in code
-    assert "calculate_discount(1, 1)" in code
-    assert "calculate_discount(-1, 1)" in code
+    # Numeric parameters get numeric values, and the guard is exercised
+    # through pytest.raises rather than through a plain call.
+    assert "calculate_discount(100, 100)" in code
+    assert "with pytest.raises(ValueError):" in code
+    assert "calculate_discount(-1, 100)" in code
 
 
 def test_unannotated_iterated_param_gets_the_inferred_dict_shape(tmp_path, monkeypatch):
@@ -152,9 +167,11 @@ def test_nonpositive_guard_excludes_zero_not_just_negatives(tmp_path, monkeypatc
         "    return price * 2\n",
     )
 
-    assert "charge(0)" not in code
-    assert "charge(1)" in code
-    assert "charge(-1)" in code  # still exercised via pytest.raises
+    # Zero trips `price <= 0`, so it may only appear inside pytest.raises.
+    assert "charge(0)" not in plain_calls(code)
+    assert "charge(0)" in code
+    assert "with pytest.raises(ValueError):" in code
+    assert "charge(100)" in plain_calls(code)
 
 
 def test_strict_negative_guard_still_allows_zero(tmp_path, monkeypatch):
@@ -169,4 +186,4 @@ def test_strict_negative_guard_still_allows_zero(tmp_path, monkeypatch):
         "    return amount\n",
     )
 
-    assert "withdraw(0)" in code
+    assert "withdraw(0)" in plain_calls(code)

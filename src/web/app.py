@@ -201,6 +201,7 @@ if generation is not None:
             execution,
             workspace.coverage_html / "index.html",
             PROJECT_ROOT,
+            {generation.target_file.name: state.get("source_name") or "source.py"},
         )
 
     if run_clicked:

@@ -1,7 +1,31 @@
+"""Emit deterministic pytest suites from an analyzed function plan.
+
+The pipeline per function is: read evidence off the AST, build one scenario per
+interesting input, probe each scenario by calling the function, then emit tests
+that assert the values the function actually produced.
+
+Nothing here is specific to any particular function or parameter name.
+"""
+
 import ast
 import importlib
 from pathlib import Path
 from typing import Dict, List, get_args, get_origin, get_type_hints
+
+from test_generator.scenarios import (
+    Scenario,
+    build_scenarios,
+    literal_expression,
+    name_scenarios,
+    needs_approx,
+    probe_call,
+    select_scenarios,
+)
+from test_generator.value_inference import collect_evidence
+
+#: Separates the import bootstrap from the generated tests. The UI shows only
+#: the part after it; the saved file keeps both.
+BODY_MARKER = "# --- generated tests ---"
 
 
 def _sanitize_name(name: str) -> str:
@@ -9,6 +33,7 @@ def _sanitize_name(name: str) -> str:
 
 
 def _guess_kind(arg_name: str) -> str:
+    """Last-resort guess from the parameter name, used only when the body says nothing."""
     n = arg_name.lower()
     if "age" in n:
         return "age"
@@ -23,23 +48,6 @@ def _guess_kind(arg_name: str) -> str:
     if "denom" in n or "div" in n or "b" == n:
         return "float_divisor"
     return "int"
-
-
-def _sample_values(kind: str) -> List[str]:
-    # values returned as python literals (strings)
-    if kind == "age":
-        return ["-1", "0", "17", "18", "65"]
-    if kind == "str":
-        return ["'Efe'", "''"]
-    if kind == "list_int":
-        return ["[]", "[2]", "[1, 2, 3, 4, 6]"]
-    if kind == "dict":
-        return ["{'x': 1}"]
-    if kind == "float_divisor":
-        return ["0", "2"]
-    if kind == "int":
-        return ["0", "1", "2", "-1"]
-    return ["1"]
 
 
 def infer_dict_keys_from_ast(function_source: str) -> set[str]:
@@ -63,48 +71,6 @@ def infer_dict_keys_from_ast(function_source: str) -> set[str]:
                 if isinstance(first, ast.Constant) and isinstance(first.value, str):
                     keys.add(first.value)
     return keys
-
-
-def _infer_param_guards(function_source: str, param_names: List[str]) -> Dict[str, Dict[str, bool]]:
-    flags: Dict[str, Dict[str, bool]] = {
-        name: {
-            "divisor": False,
-            "zero_checked": False,
-            "negative_checked": False,
-            "nonpositive_checked": False,
-        }
-        for name in param_names
-    }
-    if not function_source or not param_names:
-        return flags
-    try:
-        tree = ast.parse(function_source)
-    except SyntaxError:
-        return flags
-    name_set = set(param_names)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Mod)):
-            right_names = {
-                n.id for n in ast.walk(node.right) if isinstance(n, ast.Name) and n.id in name_set
-            }
-            for name in right_names:
-                flags[name]["divisor"] = True
-        if isinstance(node, ast.Compare):
-            sides = [node.left, *node.comparators]
-            for side in sides:
-                if isinstance(side, ast.Name) and side.id in name_set:
-                    other = node.left if side is not node.left else (node.comparators[0] if node.comparators else None)
-                    if isinstance(other, ast.Constant) and other.value == 0:
-                        if any(isinstance(op, (ast.Lt, ast.LtE)) for op in node.ops):
-                            flags[side.id]["negative_checked"] = True
-                        # `x <= 0` rejects zero too, so zero is not a safe input.
-                        if side is node.left and any(
-                            isinstance(op, ast.LtE) for op in node.ops
-                        ):
-                            flags[side.id]["nonpositive_checked"] = True
-                        if any(isinstance(op, ast.Eq) for op in node.ops):
-                            flags[side.id]["zero_checked"] = True
-    return flags
 
 
 def _default_value_for_key(key: str):
@@ -144,6 +110,8 @@ def _normalize_annotation(param_annotation):
             return "int"
         if s_lower in {"float", "builtins.float"}:
             return "float"
+        if s_lower in {"bool", "builtins.bool"}:
+            return "bool"
         if s_lower.startswith("list"):
             return "list"
         return "unknown"
@@ -158,6 +126,8 @@ def _normalize_annotation(param_annotation):
     if origin is not None and args:
         if type(None) in args and str in args:
             return "optional_str"
+    if param_annotation is bool:
+        return "bool"
     if param_annotation is str:
         return "str"
     if param_annotation is int:
@@ -167,267 +137,167 @@ def _normalize_annotation(param_annotation):
     return "unknown"
 
 
-def build_safe_arg_value(param_name: str, param_annotation, inferred_keys: set[str], usage_kind: str | None = None):
+def build_safe_arg_value(param_name: str, param_annotation, inferred_keys: set[str]):
+    """A value that is merely type-plausible, used when the body gives no evidence."""
     kind = _normalize_annotation(param_annotation)
-    if kind == "unknown" and usage_kind:
-        if usage_kind == "numeric":
-            return 1
-        if usage_kind == "list_dict":
-            return [_build_dict_from_keys(inferred_keys)]
-        if usage_kind == "dict":
-            return _build_dict_from_keys(inferred_keys)
-        if usage_kind == "list":
-            return []
     if kind == "list_dict":
         return [_build_dict_from_keys(inferred_keys)]
     if kind == "dict":
         return _build_dict_from_keys(inferred_keys)
     if kind == "optional_str":
-        return "SAVE10"
+        return "text"
     if kind == "str":
         return "text"
+    if kind == "bool":
+        return True
     if kind == "int":
         return 1
     if kind == "float":
         return 1.0
     if kind == "list":
         return []
+
     guessed = _guess_kind(param_name)
     if guessed == "str":
         return "text"
     if guessed == "list_int":
-        return [{"x": 1}]
+        return [1, 2, 3]
     if guessed == "dict":
-        return {"x": 1}
+        return _build_dict_from_keys(inferred_keys)
     if guessed == "float_divisor":
         return 2.0
-    return 0
+    if guessed == "age":
+        return 30
+    return 1
 
 
-ARITHMETIC_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv)
+def _usage_fallback(evidence, param_name, hint, inferred_keys):
+    """Shape the fallback with what the body does, before falling back to names."""
+    if evidence.iterated:
+        if evidence.subscript_keys or infer_keys_present(inferred_keys):
+            return [_build_dict_from_keys(evidence.subscript_keys or inferred_keys)]
+        return [1, 2, 3]
+    if evidence.subscript_keys:
+        return _build_dict_from_keys(evidence.subscript_keys)
+    return build_safe_arg_value(param_name, hint, inferred_keys)
 
 
-def _infer_usage_kinds(function_source: str, param_names: List[str], inferred_keys: set[str]) -> Dict[str, str]:
-    """Guess a parameter's type from how the body uses it.
+def infer_keys_present(keys: set[str]) -> bool:
+    return bool(keys)
 
-    Unannotated code is the common case for pasted snippets, and the name-based
-    fallback alone happily feeds `''` or `None` to a function that immediately
-    compares its argument to a number. Reading the body is far more reliable.
-    """
-    kinds: Dict[str, str] = {}
-    if not function_source or not param_names:
-        return kinds
+
+def _parsed_defaults(raw_defaults: Dict[str, str]) -> Dict[str, object]:
+    """Declared defaults, kept only when they are plain literals."""
+    parsed: Dict[str, object] = {}
+    for name, text in (raw_defaults or {}).items():
+        try:
+            parsed[name] = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            continue
+    return parsed
+
+
+def _raised_exception_names(function_source: str) -> List[str]:
+    """Exception class names raised directly by the function, in source order."""
+    if not function_source:
+        return []
     try:
         tree = ast.parse(function_source)
     except SyntaxError:
-        return kinds
-
-    names = set(param_names)
-    numeric: set[str] = set()
-    iterated: set[str] = set()
-    str_subscripted: set[str] = set()
-
+        return []
+    names: List[str] = []
     for node in ast.walk(tree):
-        if isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.iter, ast.Name):
-            if node.iter.id in names:
-                iterated.add(node.iter.id)
-
-        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-            if node.value.id in names:
-                key = node.slice
-                if isinstance(key, ast.Index):  # Python < 3.9 shape
-                    key = key.value
-                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    str_subscripted.add(node.value.id)
-
-        elif isinstance(node, ast.Compare):
-            sides = [node.left, *node.comparators]
-            has_number = any(
-                isinstance(s, ast.Constant) and isinstance(s.value, (int, float))
-                and not isinstance(s.value, bool)
-                for s in sides
-            )
-            if has_number:
-                for side in sides:
-                    if isinstance(side, ast.Name) and side.id in names:
-                        numeric.add(side.id)
-
-        elif isinstance(node, ast.BinOp) and isinstance(node.op, ARITHMETIC_OPS):
-            for side in (node.left, node.right):
-                if isinstance(side, ast.Name) and side.id in names:
-                    numeric.add(side.id)
-
-    for name in names:
-        if name in iterated:
-            kinds[name] = "list_dict" if inferred_keys else "list"
-        elif name in str_subscripted:
-            kinds[name] = "dict"
-        elif name in numeric:
-            kinds[name] = "numeric"
-
-    return kinds
+        if not isinstance(node, ast.Raise) or node.exc is None:
+            continue
+        exc = node.exc
+        if isinstance(exc, ast.Call):
+            exc = exc.func
+        if isinstance(exc, ast.Name) and exc.id not in names:
+            names.append(exc.id)
+    return names
 
 
-def _build_arg_candidates(
-    param_name: str,
-    param_annotation,
-    inferred_keys: set[str],
-    usage_kind: str | None = None,
-) -> List:
-    kind = _normalize_annotation(param_annotation)
-    if kind == "unknown" and usage_kind:
-        if usage_kind == "numeric":
-            return [1, 0, -1, 2]
-        if usage_kind == "list_dict":
-            base = _build_dict_from_keys(inferred_keys)
-            return [[base], [base, base]]
-        if usage_kind == "dict":
-            return [_build_dict_from_keys(inferred_keys)]
-        if usage_kind == "list":
-            return [[], [1]]
-    if kind == "optional_str":
-        return ["SAVE10", "INVALID", None]
-    if kind == "int":
-        return [1, 0, -1]
-    if kind == "float":
-        return [1.0, 0.0, -1.0]
-    if kind == "list_dict":
-        base = _build_dict_from_keys(inferred_keys)
-        return [[base], [base, base]]
-    if kind == "dict":
-        return [_build_dict_from_keys(inferred_keys)]
-    if kind == "str":
-        return ["text", ""]
-    if kind == "list":
-        return [[], [1]]
-    guessed = _guess_kind(param_name)
-    if guessed == "str":
-        return ["text", ""]
-    if guessed == "list_int":
-        return [[{"x": 1}], []]
-    if guessed == "dict":
-        return [{"x": 1}]
-    return [0, "", None]
-
-
-def _format_arg_value(value) -> str:
-    return repr(value)
-
-
-def _is_numeric_param(param_name: str, param_annotation, usage_kind: str | None = None) -> bool:
-    kind = _normalize_annotation(param_annotation)
-    if kind in {"int", "float"}:
-        return True
-    if kind == "unknown" and usage_kind:
-        return usage_kind == "numeric"
-    guessed = _guess_kind(param_name)
-    return guessed in {"age", "int", "float_divisor"}
-
-
-def _infer_negative_dict_keys(function_source: str, inferred_keys: set[str]) -> set[str]:
-    if not function_source or not inferred_keys:
-        return set()
-    try:
-        tree = ast.parse(function_source)
-    except SyntaxError:
-        return set()
-    neg_keys: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Compare) and any(isinstance(op, (ast.Lt, ast.LtE)) for op in node.ops):
-            sides = [node.left, *node.comparators]
-            for side in sides:
-                if isinstance(side, ast.Subscript):
-                    key_node = side.slice
-                    if isinstance(key_node, ast.Index):
-                        key_node = key_node.value
-                    if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
-                        if key_node.value in inferred_keys:
-                            neg_keys.add(key_node.value)
-    return neg_keys
-
-
-def _infer_print_param_targets(function_source: str, param_names: List[str]) -> set[str]:
-    if not function_source or not param_names:
-        return set()
-    try:
-        tree = ast.parse(function_source)
-    except SyntaxError:
-        return set()
-    names = set(param_names)
-    targets: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.If):
-            if not any(
-                isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "print"
-                for n in ast.walk(node)
-            ):
-                continue
-            test = node.test
-            if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(test.operand, ast.Name):
-                if test.operand.id in names:
-                    targets.add(test.operand.id)
-            elif isinstance(test, ast.Compare) and isinstance(test.left, ast.Name):
-                if test.left.id in names and test.comparators:
-                    comp = test.comparators[0]
-                    if isinstance(comp, ast.Constant) and comp.value is None:
-                        targets.add(test.left.id)
-                    if isinstance(comp, ast.Constant) and comp.value == 0:
-                        targets.add(test.left.id)
-    return targets
-
-
-def _build_print_call_args(
-    args: List[str],
-    arg_candidates: List[List],
-    annotations: Dict[str, str | None],
-    inferred_keys: set[str],
-    function_source: str,
-    print_strings: List[str],
-):
-    overrides = {}
-    targets = _infer_print_param_targets(function_source, args)
-    for a in args:
-        kind = _normalize_annotation(annotations.get(a))
-        if a in targets:
-            if kind in {"list", "list_dict"}:
-                overrides[a] = []
-            elif kind == "dict":
-                overrides[a] = {}
-            elif kind == "optional_str":
-                overrides[a] = None
-            elif kind == "str":
-                overrides[a] = ""
-            elif kind in {"int", "float"}:
-                overrides[a] = 0
-        if kind == "optional_str" and print_strings:
-            overrides[a] = "INVALID"
-    values = []
-    for idx, a in enumerate(args):
-        if a in overrides:
-            values.append(_format_arg_value(overrides[a]))
-        else:
-            values.append(_format_arg_value(arg_candidates[idx][0]))
-    return ", ".join(values)
-
-
-def _call_expr(fn_name: str, arg_str: str, is_async: bool) -> str:
-    call = f"{fn_name}({arg_str})"
+def _call_expr(fn_name: str, args: List, is_async: bool) -> str:
+    rendered = ", ".join(repr(a) for a in args)
+    call = f"{fn_name}({rendered})"
     return f"asyncio.run({call})" if is_async else call
 
 
-def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
-    """Emit rule-based pytest source for every function in the plan.
+def _stdout_assertion(text: str) -> List[str]:
+    """Assert on captured output, exactly when that stays readable."""
+    if not text:
+        return ["    assert captured.out == ''"]
+    if len(text) <= 200:
+        return [f"    assert captured.out == {text!r}"]
+    first_line = text.splitlines()[0]
+    return [f"    assert {first_line!r} in captured.out"]
 
-    Note: this imports ``module_import`` so it can read runtime type hints,
-    which executes the target module's top-level code. Only run it on code you
-    trust. Import failures are swallowed and degrade the result to
-    annotation-string inference.
+
+def _emit_scenario(
+    lines: List[str],
+    name: str,
+    fn_name: str,
+    scenario: Scenario,
+    is_async: bool,
+    has_print: bool,
+    fallback_exception: str | None,
+) -> None:
+    call = _call_expr(fn_name, scenario.args, is_async)
+    probe = scenario.probe
+
+    if scenario.kind == "raise":
+        exception = probe.exception or fallback_exception or "Exception"
+        lines.append(f"def {name}():")
+        lines.append(f"    with pytest.raises({exception}):")
+        lines.append(f"        {call}")
+        lines.append("")
+        return
+
+    fixture = "capsys" if has_print else ""
+    lines.append(f"def {name}({fixture}):")
+
+    asserted = False
+    if probe.returned and probe.value is not None:
+        literal = literal_expression(probe.value)
+        lines.append(f"    result = {call}")
+        if literal is None:
+            lines.append("    assert result is not None")
+        elif needs_approx(probe.value):
+            lines.append(f"    assert result == pytest.approx({literal})")
+        else:
+            lines.append(f"    assert result == {literal}")
+        asserted = True
+    elif probe.returned:
+        lines.append(f"    result = {call}")
+        lines.append("    assert result is None")
+        asserted = True
+    else:
+        # No usable probe: still exercise the call, assert only what we know.
+        lines.append(f"    result = {call}")
+        lines.append("    assert result is not None")
+        asserted = True
+
+    if has_print:
+        lines.append("    captured = capsys.readouterr()")
+        lines.extend(_stdout_assertion(probe.stdout if probe.returned else ""))
+
+    if not asserted:
+        lines.append("    assert True")
+    lines.append("")
+
+
+def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
+    """Emit a deterministic pytest module for every function in the plan.
+
+    Note: the target module is imported and its functions are called so that
+    expected values can be derived from real behaviour. Only run this on code
+    you trust. When the import fails, generation degrades to weaker assertions
+    rather than guessing at results.
     """
-    lines: List[str] = []
     functions = test_plan["functions"]
     needs_asyncio = any(fn.get("is_async") for fn in functions)
 
-    # --- imports & path fix ---
+    lines: List[str] = []
     lines.append("import os")
     lines.append("import sys")
     if needs_asyncio:
@@ -450,8 +320,9 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
         f"from {module_import} import " + ", ".join(fn["name"] for fn in functions)
     )
     lines.append("")
+    lines.append(BODY_MARKER)
+    lines.append("")
 
-    module_obj = None
     try:
         module_obj = importlib.import_module(module_import)
     except Exception:
@@ -459,154 +330,79 @@ def generate_pytest_code(test_plan: Dict, module_import: str) -> str:
 
     for fn in functions:
         fn_name = fn["name"]
-        args = fn["args"]
-        safe_fn = _sanitize_name(fn_name)
-        is_async = bool(fn.get("is_async", False))
-
-        # Sample arg literals
-        annotations = fn.get("annotations", {})
+        params = fn["args"]
         fn_source = fn.get("source", "")
-        inferred_keys = infer_dict_keys_from_ast(fn_source)
-        negative_dict_keys = _infer_negative_dict_keys(fn_source, inferred_keys)
-        type_hints = {}
+        annotations = fn.get("annotations", {})
+        is_async = bool(fn.get("is_async", False))
+        has_print = bool(fn.get("has_print", False))
+
+        fn_obj = None
+        type_hints: Dict = {}
         if module_obj is not None:
             try:
                 fn_obj = getattr(module_obj, fn_name)
                 type_hints = get_type_hints(fn_obj, include_extras=True)
             except Exception:
+                fn_obj = getattr(module_obj, fn_name, None)
                 type_hints = {}
 
-        has_negative_check = bool(fn.get("has_negative_check", False))
-        raises_value_error = bool(fn.get("raises_value_error", False))
+        inferred_keys = infer_dict_keys_from_ast(fn_source)
+        evidence = collect_evidence(fn_source, params)
 
-        arg_candidates = []
-        param_flags = _infer_param_guards(fn_source, args)
-        usage_kinds = _infer_usage_kinds(fn_source, args, inferred_keys)
-        for a in args:
-            hint = type_hints.get(a, annotations.get(a))
-            candidates = _build_arg_candidates(a, hint, inferred_keys, usage_kinds.get(a))
-            flags = param_flags.get(a, {})
-            if flags.get("divisor") and not flags.get("zero_checked"):
-                candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c == 0)]
-            if has_negative_check or raises_value_error or flags.get("negative_checked"):
-                candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c < 0)]
-            if flags.get("nonpositive_checked"):
-                candidates = [c for c in candidates if not (isinstance(c, (int, float)) and c <= 0)]
-            if not candidates:
-                candidates = [build_safe_arg_value(a, hint, inferred_keys, usage_kinds.get(a))]
-            arg_candidates.append(candidates)
+        hints = {n: type_hints.get(n, annotations.get(n)) for n in params}
+        kinds = {n: _normalize_annotation(hints[n]) for n in params}
+        # A declared non-numeric type outranks numeric evidence from the body.
+        numeric_ok = {n: kinds[n] in {"unknown", "int", "float"} for n in params}
+        prefer_float = {n: kinds[n] == "float" for n in params}
 
-        typical_call = ", ".join(_format_arg_value(vals[0]) for vals in arg_candidates) if args else ""
-        alt_call_1 = ", ".join(_format_arg_value((vals[1] if len(vals) > 1 else vals[0])) for vals in arg_candidates) if args else ""
-        alt_call_2 = ", ".join(_format_arg_value((vals[2] if len(vals) > 2 else vals[0])) for vals in arg_candidates) if args else ""
+        fallbacks = {
+            name: _usage_fallback(evidence[name], name, hints[name], inferred_keys)
+            for name in params
+        }
+        defaults = _parsed_defaults(fn.get("defaults", {}))
 
-        has_print = bool(fn.get("has_print", False))
-        returns_count = int(fn.get("returns_count", 0))
-        print_strings = fn.get("print_strings", [])
+        scenarios = build_scenarios(
+            params, evidence, fallbacks, defaults, numeric_ok, prefer_float
+        )
 
-        if has_print:
-            lines.append(f"def test_{safe_fn}_prints_or_runs(capsys):")
-            if args:
-                print_call = _build_print_call_args(
-                    args,
-                    arg_candidates,
-                    annotations,
-                    inferred_keys,
-                    fn_source,
-                    print_strings,
-                )
-            else:
-                print_call = ""
-            lines.append(f"    {_call_expr(fn_name, print_call, is_async)}")
-            lines.append("    captured = capsys.readouterr()")
-            if print_strings:
-                lines.append(f"    assert {print_strings[0]!r} in captured.out")
-            else:
-                lines.append("    assert captured.out != ''")
-            lines.append("")
+        raised_names = _raised_exception_names(fn_source)
 
-        if returns_count == 0:
-            lines.append(f"def test_{safe_fn}_runs_without_exception():")
-            lines.append(f"    {_call_expr(fn_name, typical_call, is_async)}")
-            lines.append("    assert True")
-            lines.append("")
-
+        if fn_obj is not None:
+            for scenario in scenarios:
+                scenario.probe = probe_call(fn_obj, scenario.args, is_async)
+            selected = select_scenarios(scenarios, set(raised_names))
         else:
-            lines.append(f"def test_{safe_fn}_typical_returns_value():")
-            lines.append(f"    result = {_call_expr(fn_name, typical_call, is_async)}")
-            lines.append("    assert result is not None")
-            lines.append("")
+            # Without the module we cannot confirm behaviour; keep the
+            # non-error scenarios and assert only that they run.
+            selected = [s for s in scenarios if s.kind != "raise"][:3]
+            if raised_names:
+                selected.extend(s for s in scenarios if s.kind == "raise")
 
-            lines.append(f"def test_{safe_fn}_edge_case_returns_value():")
-            lines.append(f"    result = {_call_expr(fn_name, alt_call_1, is_async)}")
-            lines.append("    assert result is not None")
-            lines.append("")
+        if not selected:
+            continue
 
-            if fn.get("has_for") or fn.get("has_while") or fn.get("has_if") or returns_count >= 2:
-                lines.append(f"def test_{safe_fn}_additional_case_returns_value():")
-                lines.append(f"    result = {_call_expr(fn_name, alt_call_2, is_async)}")
-                lines.append("    assert result is not None")
-                lines.append("")
-
-        if raises_value_error:
-            neg_arg_index = None
-            numeric_negative_checked = False
-            for idx, a in enumerate(args):
-                flags = param_flags.get(a, {})
-                hint = type_hints.get(a, annotations.get(a))
-                if flags.get("negative_checked"):
-                    neg_arg_index = idx
-                    numeric_negative_checked = True
-                    break
-                if _is_numeric_param(a, hint, usage_kinds.get(a)):
-                    neg_arg_index = idx
-                    break
-
-            dict_neg_index = None
-            if negative_dict_keys:
-                for idx, a in enumerate(args):
-                    hint = type_hints.get(a, annotations.get(a))
-                    kind = _normalize_annotation(hint)
-                    if kind in {"list_dict", "dict"}:
-                        dict_neg_index = idx
-                        break
-
-            if dict_neg_index is not None and not numeric_negative_checked:
-                hint = type_hints.get(args[dict_neg_index], annotations.get(args[dict_neg_index]))
-                kind = _normalize_annotation(hint)
-                base = _build_dict_from_keys(inferred_keys)
-                for key in negative_dict_keys:
-                    if key in base:
-                        base[key] = -1
-                neg_value = [base] if kind == "list_dict" else base
-                neg_args = []
-                for jdx, vals in enumerate(arg_candidates):
-                    if jdx == dict_neg_index:
-                        neg_args.append(_format_arg_value(neg_value))
-                    else:
-                        neg_args.append(_format_arg_value(vals[0]))
-                neg_call = ", ".join(neg_args)
-                lines.append(f"def test_{safe_fn}_negative_raises_value_error():")
-                lines.append("    with pytest.raises(ValueError):")
-                lines.append(f"        {_call_expr(fn_name, neg_call, is_async)}")
-                lines.append("")
-            elif neg_arg_index is not None:
-                neg_args = []
-                for idx, vals in enumerate(arg_candidates):
-                    if idx == neg_arg_index:
-                        hint = type_hints.get(args[idx], annotations.get(args[idx]))
-                        kind = _normalize_annotation(hint)
-                        neg_value = -1.0 if kind == "float" else -1
-                        neg_args.append(_format_arg_value(neg_value))
-                    else:
-                        neg_args.append(_format_arg_value(vals[0]))
-                neg_call = ", ".join(neg_args)
-                lines.append(f"def test_{safe_fn}_negative_raises_value_error():")
-                lines.append("    with pytest.raises(ValueError):")
-                lines.append(f"        {_call_expr(fn_name, neg_call, is_async)}")
-                lines.append("")
+        fallback_exception = next(iter(raised_names), None)
+        names = name_scenarios(fn_name, selected)
+        for name, scenario in zip(names, selected):
+            _emit_scenario(
+                lines,
+                name,
+                fn_name,
+                scenario,
+                is_async,
+                has_print,
+                fallback_exception,
+            )
 
     return "\n".join(lines)
+
+
+def generated_body(code: str) -> str:
+    """The generated tests without the import bootstrap, for UI preview."""
+    marker = code.find(BODY_MARKER)
+    if marker == -1:
+        return code
+    return code[marker + len(BODY_MARKER):].strip("\n")
 
 
 def save_tests(pytest_code: str, output_path: Path) -> Path:

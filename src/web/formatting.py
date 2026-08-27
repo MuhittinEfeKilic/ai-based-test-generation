@@ -270,13 +270,20 @@ def structure_table_html(functions: list[dict]) -> str:
     )
 
 
-def coverage_files_table_html(files: list) -> str:
-    """Per-file coverage, shown only when coverage.py reported more than one."""
+def coverage_files_table_html(files: list, display_names: dict | None = None) -> str:
+    """Per-file coverage.
+
+    `display_names` maps the scratch module's filename back to the name the
+    user supplied, so the table shows `pasted_input.py` rather than an internal
+    `tmp_target_...` name.
+    """
     if not files:
         return ""
+    names = display_names or {}
     head = "<tr><th>File</th><th>Statements</th><th>Missed</th><th>Coverage</th></tr>"
     rows = "".join(
-        f'<tr><td class="name">{escape(Path(f.path).name)}</td>'
+        f'<tr><td class="name">'
+        f"{escape(names.get(Path(f.path).name, Path(f.path).name))}</td>"
         f"<td>{f.statements}</td><td>{f.missing}</td>"
         f"<td>{f.percent:.0f}%</td></tr>"
         for f in files

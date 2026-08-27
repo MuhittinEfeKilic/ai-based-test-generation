@@ -391,7 +391,7 @@ div[data-testid="stCode"] pre {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   font-size: 0.78rem;
-  max-height: 460px;
+  max-height: 620px;
   overflow: auto;
 }
 

@@ -11,6 +11,7 @@ from formatting import (
     mode_label,
     panel_title_html,
 )
+from test_generator.test_generator import generated_body
 
 
 def render_generated(generation, source_name: str | None) -> None:
@@ -28,11 +29,7 @@ def render_generated(generation, source_name: str | None) -> None:
             f"instead. Reason: {generation.ai_error}"
         )
 
-    caption = (
-        f"{mode_label(generation.mode)} &middot; target module "
-        f"`{generation.module_import}`"
-    )
-    st.caption(caption)
+    st.caption(f"{mode_label(generation.mode)} &middot; source `{source_name or 'source.py'}`")
 
     if ai_code:
         det_tab, ai_tab = st.tabs(
@@ -69,7 +66,9 @@ def render_generated(generation, source_name: str | None) -> None:
 
 def _render_suite(code: str, filename: str, note: str, key: str, primary: bool) -> None:
     st.caption(f"`{filename}` &middot; {count_tests(code)} test functions &middot; {note}")
-    st.code(code, language="python")
+    # The preview shows the tests themselves; the sys.path/skip bootstrap is
+    # implementation detail and stays in the downloaded file.
+    st.code(generated_body(code), language="python")
     st.download_button(
         "Download .py",
         data=code,

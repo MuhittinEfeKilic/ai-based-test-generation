@@ -14,7 +14,12 @@ from formatting import (
 )
 
 
-def render(execution, html_index: Path, project_root: Path) -> None:
+def render(
+    execution,
+    html_index: Path,
+    project_root: Path,
+    display_names: dict | None = None,
+) -> None:
     st.markdown(panel_title_html("Coverage Report", "coverage.py"), unsafe_allow_html=True)
 
     if execution is None:
@@ -33,7 +38,10 @@ def render(execution, html_index: Path, project_root: Path) -> None:
     st.caption("Statement coverage of the analyzed module. Branch coverage is not measured.")
 
     if execution.files:
-        st.markdown(coverage_files_table_html(execution.files), unsafe_allow_html=True)
+        st.markdown(
+            coverage_files_table_html(execution.files, display_names),
+            unsafe_allow_html=True,
+        )
 
     if execution.report:
         with st.expander("View coverage.py report"):

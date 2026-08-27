@@ -222,3 +222,22 @@ def test_paths_outside_the_project_fall_back_to_the_bare_name(tmp_path):
 
     assert rendered == "report.html"
     assert "\\" not in rendered and "/" not in rendered
+
+
+def test_coverage_table_shows_the_user_facing_source_name():
+    """The scratch module name is an implementation detail, not a label."""
+    html = coverage_files_table_html(
+        [FileCoverage(path="data/sample_code/tmp_target_1_ab.py", statements=12, missing=0, percent=100.0)],
+        {"tmp_target_1_ab.py": "pasted_input.py"},
+    )
+
+    assert "pasted_input.py" in html
+    assert "tmp_target" not in html
+
+
+def test_coverage_table_falls_back_to_the_real_name():
+    html = coverage_files_table_html(
+        [FileCoverage(path="a/b/other.py", statements=1, missing=0, percent=100.0)], {}
+    )
+
+    assert "other.py" in html
